@@ -1,0 +1,3 @@
+Distributed systems coordinate many machines over a network. Replication
+improves fault tolerance, and sharding splits data across nodes so no single
+machine holds everything.

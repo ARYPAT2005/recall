@@ -1,0 +1,3 @@
+Rust enforces memory safety without a garbage collector. Ownership means every
+value has exactly one owner, and borrowing lets you reference a value without
+taking ownership of it.

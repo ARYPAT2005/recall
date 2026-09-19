@@ -1,0 +1,3 @@
+Machine learning models learn patterns from training data. Gradient descent
+optimizes the loss function by repeatedly stepping in the direction of the
+negative gradient.

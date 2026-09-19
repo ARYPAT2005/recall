@@ -1,0 +1,10 @@
+[package]
+name = "recall"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"        # only for reading peak memory usage in the benchmark
+
+[profile.release]
+debug = true        # keep symbols so profilers (samply/Instruments) can read the binary

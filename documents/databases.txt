@@ -1,0 +1,2 @@
+A database index speeds up lookups by avoiding a full table scan. B trees keep
+data sorted on disk, while hash indexes give constant time exact match lookups.

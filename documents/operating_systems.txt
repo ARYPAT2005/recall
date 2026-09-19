@@ -1,0 +1,3 @@
+An operating system manages memory, scheduling, and file systems. Virtual
+memory gives each process the illusion of a private address space using page
+tables.

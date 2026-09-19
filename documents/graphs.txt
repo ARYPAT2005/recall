@@ -1,0 +1,2 @@
+Graph traversal algorithms include breadth first search and depth first search.
+Dijkstra finds shortest paths in a weighted graph with non negative edges.

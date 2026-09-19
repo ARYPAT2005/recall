@@ -1,0 +1,3 @@
+Dynamic programming breaks a problem into overlapping subproblems and stores
+the results so each subproblem is solved only once. Classic examples include
+knapsack, longest common subsequence, and edit distance.

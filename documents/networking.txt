@@ -1,0 +1,3 @@
+TCP provides reliable ordered delivery over an unreliable network using
+sequence numbers and acknowledgements. UDP is connectionless and does not
+retransmit lost packets.
