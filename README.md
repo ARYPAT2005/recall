@@ -1,10 +1,69 @@
 # Recall
 
-A full-text search engine written from scratch in Rust — inverted index, benchmark
-harness, and a log of every optimization step with the numbers that justified it.
+Recall is a full-text search engine written from scratch in Rust. It indexes a
+collection of documents, keeps the index compressed in memory, splits it into shards
+that are built and searched on parallel threads, and answers multi-word queries with
+the documents that contain every word, ranked by relevance (BM25).
 
-No search libraries, no async runtime, no dependencies except `libc` (used only to
-read peak memory in the benchmark).
+Everything is in this repo: tokenizer, hash function, compression, intersection
+algorithms, ranking and the thread pool. There are no search libraries and no runtime
+dependencies; the one dependency, `libc`, is only used by the benchmark to read peak
+memory.
+
+It's also a record of how it got fast. Every optimization was measured before and after,
+and each version's numbers, including the dead ends and the bugs found in the benchmark
+itself, are in [BENCHMARKS.md](BENCHMARKS.md).
+
+## What's inside
+
+| Part | What it does |
+|------|--------------|
+| **Indexing** | Allocation-free tokenizer, hand-written FxHash term dictionary, inverted index storing how often each term appears in each document |
+| **Query engine** | AND queries run rarest term first; each step picks merge or galloping intersection; BM25 scoring; heap-based top-k; `explain` shows the plan |
+| **Storage** | Posting lists stored as delta-encoded LEB128 varints in 64-entry blocks, with a skip table so they can still be searched without decoding everything |
+| **Parallelism** | Document shards built on parallel threads, a worker pool that runs a query on all shards at once when it's worth it, corpus-wide BM25 statistics, top-k merge |
+| **Benchmarking** | Indexing throughput, P50/P95/P99 latency per query type, peak memory, and sweeps that set each tuning threshold |
+
+## How it works
+
+**Building the index.** The corpus file is cut into one byte range per shard, and each
+thread builds a complete index for its range. No thread touches another's index, so
+there are no locks.
+
+```mermaid
+flowchart TD
+    A["corpus file<br/>one document per line"] --> B["cut into N byte ranges<br/>at line breaks"]
+    subgraph T["each of N threads, in parallel, no locks"]
+        T1["read its byte range"] --> T2["tokenize each document<br/>without copying words"]
+        T2 --> T3["map each word to a term id<br/>FxHash dictionary"]
+        T3 --> T4["count each term<br/>within the document"]
+        T4 --> T5["append the doc-id gap and count<br/>as varints to the term's posting list<br/>64-entry blocks + skip table"]
+    end
+    B --> T
+    T --> D["N shard indexes<br/>global doc id = shard's first id + local id"]
+```
+
+**Answering a query.** A coordinator weighs the query terms using statistics from the
+whole corpus, decides whether the query is big enough to run on all shards at once,
+collects each shard's best k results, and merges them.
+
+```mermaid
+flowchart TD
+    Q["query, e.g. distributed systems rust"] --> P["tokenize and dedupe the terms"]
+    P --> G["coordinator adds up each term's document count<br/>across all shards: corpus-wide idf and average length"]
+    G --> E{"estimated work,<br/>from those counts,<br/>above the threshold?"}
+    E -->|yes| PAR["all shards at once,<br/>on their worker threads"]
+    E -->|no| SEQ["shards one after another,<br/>on the calling thread"]
+    subgraph SH["inside every shard"]
+        S1["look up each term's posting list"] --> S2["intersect, rarest term first:<br/>merge when lengths are similar,<br/>gallop over the skip table when one is 16x+ longer"]
+        S2 --> S3["BM25-score every match<br/>with the corpus-wide statistics"]
+        S3 --> S4["keep the best k in a heap"]
+    end
+    PAR --> SH
+    SEQ --> SH
+    SH --> M["coordinator merges the shards' top k lists"]
+    M --> R["final top k: identical to a single, unsharded index"]
+```
 
 ## Why
 
@@ -81,7 +140,7 @@ coordinator estimates the query's work from global dfs, the way a database plann
 does: candidates start at the rarest term's df and shrink by df/N per term, assuming
 terms occur independently. Shards run in parallel only above a threshold taken from a
 measured sweep. Each shard has a long-lived worker thread waiting on a channel;
-starting fresh threads per query cost ~45 µs, more than most queries take.
+starting fresh threads per query cost ~39 µs, more than most queries take.
 
 **`explain` runs the real code path.** The query plan is recorded by the same function
 that answers normal searches, with tracing switched on, so it can't drift from what
@@ -93,8 +152,8 @@ moves. The Zipfian distribution matters just as much: with uniformly sampled wor
 every posting list would be the same length, and both BM25's IDF term and the
 intersection optimization would look pointless.
 
-**The engine is a library, not a `main.rs`.** A shard is just this struct in its own
-process, so keeping it importable is what makes sharding possible later.
+**The engine is a library, not a `main.rs`.** A shard is just an `Index`, so sharding
+was a layer on top of the existing engine rather than a rewrite of it.
 
 **The benchmark was built before the optimizations**, not after. It groups queries by
 term frequency (common terms have long posting lists and behave nothing like rare
@@ -167,16 +226,3 @@ src/bin/bench.rs     benchmark harness (throughput, latency percentiles, peak RS
 documents/           small hand-written corpus for sanity checks
 BENCHMARKS.md        every version's numbers, in order
 ```
-
-## Roadmap
-
-- [x] V1: in-memory inverted index, single-term lookup, benchmark harness
-- [x] V2/V3: multi-term AND with adaptive merge/galloping intersection
-- [x] V4: indexing performance (tokenizer, key allocation, hashing)
-- [x] V5: BM25 relevance scoring with top-k selection
-- [x] V6: `explain` query plans
-- [x] V7: posting list compression (blocked delta + varint)
-- [x] V8: document-partitioned shards built in parallel, global BM25 statistics,
-      worker-pool fan-out with a cost-based parallel/sequential choice
-- [ ] Win back V7's query cost: decode blocks only as far as needed, separate tf stream
-- [ ] Sharding across processes

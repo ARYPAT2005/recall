@@ -82,7 +82,7 @@ pub struct ShardedIndex {
 }
 
 /// A long-lived thread that answers queries for one shard. Starting a thread
-/// per query cost ~45 µs of overhead (see BENCHMARKS.md, V8), more than most
+/// per query cost ~39 µs of overhead (see BENCHMARKS.md, V8), more than most
 /// queries take; a parked worker only has to be woken up.
 struct Worker {
     jobs: Option<mpsc::Sender<Job>>,
