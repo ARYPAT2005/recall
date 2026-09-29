@@ -31,12 +31,11 @@ fn main() -> io::Result<()> {
             break; // Ctrl-D
         }
 
-        let query = line.trim().to_lowercase();
-        if query.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
 
-        let hits = index.postings_for(&query);
+        let hits = index.search(&line);
         if hits.is_empty() {
             println!("No results.");
         } else {

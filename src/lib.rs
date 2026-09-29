@@ -5,6 +5,7 @@
 //! makes sharding possible later: a shard is just this struct in its own
 //! process.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
@@ -23,6 +24,94 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase())
         .collect()
+}
+
+/// How two posting lists get intersected. `Adaptive` is what `search` uses;
+/// the other two exist so the benchmark can measure each algorithm alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    Merge,
+    Gallop,
+    Adaptive,
+}
+
+/// Adaptive switches from merge to galloping once the longer list is at least
+/// this many times the shorter one. Chosen from the ratio sweep in bench.rs.
+pub const GALLOP_RATIO: usize = 16;
+
+/// Documents present in both sorted, deduped lists, choosing the algorithm
+/// from the length ratio.
+pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    intersect_with(a, b, Strategy::Adaptive)
+}
+
+pub fn intersect_with(a: &[DocId], b: &[DocId], strategy: Strategy) -> Vec<DocId> {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    match strategy {
+        Strategy::Merge => intersect_merge(small, large),
+        Strategy::Gallop => intersect_gallop(small, large),
+        Strategy::Adaptive => {
+            if large.len() >= small.len().saturating_mul(GALLOP_RATIO) {
+                intersect_gallop(small, large)
+            } else {
+                intersect_merge(small, large)
+            }
+        }
+    }
+}
+
+/// Galloping (exponential) search: for each id in `small`, probe `large` at
+/// offsets 1, 2, 4, 8... past the last match until we overshoot, then binary
+/// search inside that bracket. Cost is O(m log(n/m)) instead of O(m + n), so
+/// "zyzzyva AND the" skips most of the 90K-entry list rather than walking it.
+/// Loses to merge when the lists are similar in length: every step pays for a
+/// binary search where merge would just bump a cursor.
+pub fn intersect_gallop(small: &[DocId], large: &[DocId]) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(small.len());
+    // Everything in large[..base] is already known to be < the current id.
+    let mut base = 0;
+    for &id in small {
+        let rest = &large[base..];
+
+        // Double `hi` while rest[hi] is still too small. When it stops, id
+        // (if present) lies in rest[hi/2 ..= hi].
+        let mut hi = 1;
+        while hi < rest.len() && rest[hi] < id {
+            hi *= 2;
+        }
+        let lo = hi / 2;
+        let end = (hi + 1).min(rest.len());
+        base += lo + rest[lo..end].partition_point(|&x| x < id);
+
+        if base == large.len() {
+            break; // every remaining id in small is past the end of large
+        }
+        if large[base] == id {
+            out.push(id);
+            base += 1;
+        }
+    }
+    out
+}
+
+/// Two cursors walk in lockstep and the smaller one advances, so this is
+/// O(len(a) + len(b)) with no hashing - it only works because add_document
+/// keeps every list sorted.
+pub fn intersect_merge(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -85,6 +174,42 @@ impl Index {
         self.postings.get(term).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Boolean AND: documents containing every term in the query. The query
+    /// goes through the same tokenizer as the documents, so "Machine
+    /// Learning!" and "machine learning" are the same search.
+    pub fn search(&self, query: &str) -> Vec<DocId> {
+        self.search_with(query, Strategy::Adaptive)
+    }
+
+    pub fn search_with(&self, query: &str, strategy: Strategy) -> Vec<DocId> {
+        let mut lists: Vec<&[DocId]> = tokenize(query)
+            .iter()
+            .map(|t| self.postings_for(t))
+            .collect();
+        if lists.is_empty() {
+            return Vec::new();
+        }
+
+        // Shortest first: the result can never outgrow the shortest list, so
+        // starting there bounds every later intersection by the rarest term
+        // instead of dragging the longest list through each step.
+        lists.sort_by_key(|l| l.len());
+
+        if lists.len() == 1 {
+            return lists[0].to_vec();
+        }
+        // Intersect the first pair straight from the index instead of copying
+        // the shortest list just to intersect the copy.
+        let mut result = intersect_with(lists[0], lists[1], strategy);
+        for list in &lists[2..] {
+            if result.is_empty() {
+                break;
+            }
+            result = intersect_with(&result, list, strategy);
+        }
+        result
+    }
+
     /// Index every .txt file in a directory. Good for small hand-written corpora.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> io::Result<Index> {
         let mut idx = Index::new();
@@ -120,5 +245,92 @@ impl Index {
             idx.add_document(title.to_string(), body);
         }
         Ok(idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Index {
+        let mut idx = Index::new();
+        idx.add_document("a".into(), "machine learning with rust");
+        idx.add_document("b".into(), "machine shop");
+        idx.add_document("c".into(), "deep learning, machine learning!");
+        idx.add_document("d".into(), "rust learning");
+        idx
+    }
+
+    const STRATEGIES: [Strategy; 3] = [Strategy::Merge, Strategy::Gallop, Strategy::Adaptive];
+
+    #[test]
+    fn intersect_keeps_common_ids() {
+        for s in STRATEGIES {
+            assert_eq!(intersect_with(&[1, 3, 5, 8, 12], &[3, 4, 8, 20], s), vec![3, 8]);
+            assert_eq!(intersect_with(&[1, 2], &[3, 4], s), Vec::<DocId>::new());
+            assert_eq!(intersect_with(&[], &[1, 2], s), Vec::<DocId>::new());
+            assert_eq!(intersect_with(&[1, 2], &[], s), Vec::<DocId>::new());
+        }
+    }
+
+    #[test]
+    fn gallop_handles_edges_of_the_long_list() {
+        let large: Vec<DocId> = (0..1000).map(|i| i * 3).collect();
+        // First element, last element, past the end, before the start.
+        assert_eq!(intersect_gallop(&[0], &large), vec![0]);
+        assert_eq!(intersect_gallop(&[2997], &large), vec![2997]);
+        assert_eq!(intersect_gallop(&[5000], &large), Vec::<DocId>::new());
+        assert_eq!(intersect_gallop(&[1, 2, 3], &large), vec![3]);
+        // Consecutive matches must not skip each other.
+        assert_eq!(intersect_gallop(&[3, 6, 9], &large), vec![3, 6, 9]);
+    }
+
+    #[test]
+    fn gallop_matches_merge_on_random_lists() {
+        // xorshift, fixed seed: same cases every run.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            // Vary density independently so ratios range from 1:1 to ~1:1000.
+            let universe = 1 + next() % 5000;
+            let (da, db) = (1 + next() % 1000, 1 + next() % 1000);
+            let mut list = |density: u64| -> Vec<DocId> {
+                (0..universe as DocId).filter(|_| next() % 1000 < density).collect()
+            };
+            let a = list(da);
+            let b = list(db);
+            let expected = intersect_merge(&a, &b);
+            assert_eq!(intersect_with(&a, &b, Strategy::Gallop), expected);
+            assert_eq!(intersect_with(&b, &a, Strategy::Gallop), expected);
+            assert_eq!(intersect(&a, &b), expected);
+        }
+    }
+
+    #[test]
+    fn search_is_boolean_and() {
+        let idx = sample();
+        assert_eq!(idx.search("machine learning"), vec![0, 2]);
+        assert_eq!(idx.search("rust learning machine"), vec![0]);
+        assert_eq!(idx.search("machine"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn search_tokenizes_the_query() {
+        let idx = sample();
+        assert_eq!(idx.search("  Machine, LEARNING!\n"), vec![0, 2]);
+        assert_eq!(idx.search("learning learning"), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn unknown_term_or_empty_query_matches_nothing() {
+        let idx = sample();
+        assert!(idx.search("machine zebra").is_empty());
+        assert!(idx.search("").is_empty());
+        assert!(idx.search("!!!").is_empty());
     }
 }
