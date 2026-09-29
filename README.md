@@ -1,228 +1,82 @@
 # Recall
 
-Recall is a full-text search engine written from scratch in Rust. It indexes a
-collection of documents, keeps the index compressed in memory, splits it into shards
-that are built and searched on parallel threads, and answers multi-word queries with
-the documents that contain every word, ranked by relevance (BM25).
+A search engine I wrote from scratch in Rust, with no search libraries. It indexes
+100K documents, ranks results with BM25, compresses the index, and splits it into
+shards that are built and searched in parallel.
 
-Everything is in this repo: tokenizer, hash function, compression, intersection
-algorithms, ranking and the thread pool. There are no search libraries and no runtime
-dependencies; the one dependency, `libc`, is only used by the benchmark to read peak
-memory.
-
-It's also a record of how it got fast. Every optimization was measured before and after,
-and each version's numbers, including the dead ends and the bugs found in the benchmark
-itself, are in [BENCHMARKS.md](BENCHMARKS.md).
-
-## What's inside
-
-| Part | What it does |
-|------|--------------|
-| **Indexing** | Allocation-free tokenizer, hand-written FxHash term dictionary, inverted index storing how often each term appears in each document |
-| **Query engine** | AND queries run rarest term first; each step picks merge or galloping intersection; BM25 scoring; heap-based top-k; `explain` shows the plan |
-| **Storage** | Posting lists stored as delta-encoded LEB128 varints in 64-entry blocks, with a skip table so they can still be searched without decoding everything |
-| **Parallelism** | Document shards built on parallel threads, a worker pool that runs a query on all shards at once when it's worth it, corpus-wide BM25 statistics, top-k merge |
-| **Benchmarking** | Indexing throughput, P50/P95/P99 latency per query type, peak memory, and sweeps that set each tuning threshold |
+I measured every change before and after. The numbers, and the things that didn't
+work, are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## How it works
 
-**Building the index.** The corpus file is cut into one byte range per shard, and each
-thread builds a complete index for its range. No thread touches another's index, so
-there are no locks.
+Building the index:
 
 ```mermaid
-flowchart TD
-    A["corpus file<br/>one document per line"] --> B["cut into N byte ranges<br/>at line breaks"]
-    subgraph T["each of N threads, in parallel, no locks"]
-        T1["read its byte range"] --> T2["tokenize each document<br/>without copying words"]
-        T2 --> T3["map each word to a term id<br/>FxHash dictionary"]
-        T3 --> T4["count each term<br/>within the document"]
-        T4 --> T5["append the doc-id gap and count<br/>as varints to the term's posting list<br/>64-entry blocks + skip table"]
-    end
-    B --> T
-    T --> D["N shard indexes<br/>global doc id = shard's first id + local id"]
+flowchart LR
+    A["corpus file"] --> B["split into 4 parts"]
+    B --> C["4 threads each build a shard"]
+    C --> D["compressed index"]
 ```
 
-**Answering a query.** A coordinator weighs the query terms using statistics from the
-whole corpus, decides whether the query is big enough to run on all shards at once,
-collects each shard's best k results, and merges them.
+Answering a query:
 
 ```mermaid
-flowchart TD
-    Q["query, e.g. distributed systems rust"] --> P["tokenize and dedupe the terms"]
-    P --> G["coordinator adds up each term's document count<br/>across all shards: corpus-wide idf and average length"]
-    G --> E{"estimated work,<br/>from those counts,<br/>above the threshold?"}
-    E -->|yes| PAR["all shards at once,<br/>on their worker threads"]
-    E -->|no| SEQ["shards one after another,<br/>on the calling thread"]
-    subgraph SH["inside every shard"]
-        S1["look up each term's posting list"] --> S2["intersect, rarest term first:<br/>merge when lengths are similar,<br/>gallop over the skip table when one is 16x+ longer"]
-        S2 --> S3["BM25-score every match<br/>with the corpus-wide statistics"]
-        S3 --> S4["keep the best k in a heap"]
-    end
-    PAR --> SH
-    SEQ --> SH
-    SH --> M["coordinator merges the shards' top k lists"]
-    M --> R["final top k: identical to a single, unsharded index"]
+flowchart LR
+    Q["query"] --> S["send to every shard"]
+    S --> R["each shard finds and ranks its matches"]
+    R --> M["merge each shard's top 10"]
+    M --> A["results"]
 ```
 
-## Why
+## Results
 
-Search engines are a good excuse to care about memory layout. The posting lists are
-the whole program: they dominate the footprint, they decide cache behavior, and every
-interesting optimization is about making them smaller or making them intersect faster.
-The rule for this project is that nothing gets optimized until it's measured, and every
-version's numbers go in [BENCHMARKS.md](BENCHMARKS.md) before the next one starts.
+100K generated documents (9.9M postings), Apple M2.
 
-## Current results
+| Change | Result |
+|--------|--------|
+| Merge or galloping search, picked per step | queries mixing common and rare words 6.9x faster |
+| Faster tokenizer, fewer allocations, FxHash | indexing 3.1x faster |
+| BM25 with a top-k heap | top 10 found 13x faster than sorting every match |
+| Delta + varint compression | peak memory 127 MB to 53 MB (queries 1.4-3x slower) |
+| 4 shards, built and searched in parallel | indexing 2.5x faster, heavy queries 3x faster (light queries a bit slower) |
 
-100,000 synthetic documents, Zipfian over a 50K vocabulary, ~129 tokens/doc,
-9.9M posting entries. Apple M2, `--release`. Full numbers, methodology and
-the dead ends are in [BENCHMARKS.md](BENCHMARKS.md).
+## Notes
 
-| Version | What changed | Result |
-|---------|--------------|--------|
-| V1 | In-memory inverted index, single-term lookup | 1.35 s to index, 68.3 MB peak RSS |
-| V2 | Multi-term AND via linear merge, rarest term first | common+rare query: 16.0 µs P50 |
-| V3 | Adaptive merge / galloping intersection | common+rare **6.9× faster** (2.33 µs), common×2+rare 12× |
-| V4 | Zero-copy tokenizer, no per-token key clone, FxHash | indexing **3.1× faster** (1.57 → 0.50 s) |
-| V5 | BM25 ranking, top-k by heap | top-10 is 13× faster than sorting 9K matches; posting lists doubled to hold tf |
-| V6 | `explain` query plans | showed BM25 scoring costing 10× the intersection on dense queries |
-| V7 | Blocked delta + varint posting lists | posting lists **3.2× smaller**, peak RSS 127 → 53 MB; queries 1.4–3× slower |
-| V8 | 4 document shards: parallel build, global BM25 stats, worker-pool fan-out | indexing **2.5× faster**, heavy queries **3.0× faster**; light queries 10–60% slower, peak RSS +66% |
-
-Two measurement bugs turned up along the way and are written up in
-BENCHMARKS.md: V1's "41 ns lookup" was one tick of the 24 MHz clock (the
-real number is 15 ns, 10 ns after FxHash), and an early ratio sweep
-intersected a list with itself.
-
-## Design notes
-
-**`DocId` is `u32`, not `usize`.** Posting lists are the largest structure in the
-program, so 4 bytes instead of 8 halves the memory of the thing that matters. It caps
-the index at ~4.3 billion documents.
-
-**Posting lists stay sorted and deduped for free.** Documents are indexed in ascending
-id order, and each document appends at most one entry per term, which is exactly the
-precondition intersection needs.
-
-**Rarest term first, then the right algorithm per step.** The result of an AND can
-never be larger than its rarest term's list, so intersection starts there. Each step
-then picks linear merge (O(m + n)) when the lists are similar in length or galloping
-search (O(m log(n/m))) when one is much longer. The threshold (16×) came from a sweep
-of both algorithms across length ratios, not a guess, and it had to be re-measured
-when compression changed what each algorithm costs.
-
-**BM25 with a top-k heap.** Scores use the standard k1 = 1.2, b = 0.75 and Lucene's
-always-positive idf. Only the best k survive, in a max-heap whose top is the worst
-hit kept, so most candidates cost one comparison. It beats sorting every match by
-13–18× once there are thousands of them.
-
-**Compressed posting lists that can still be searched.** Doc ids are stored as gaps,
-and gaps and term frequencies are varints, so most take one byte instead of four.
-Delta encoding alone saves nothing; the varint is what shrinks it. Varints can't be
-indexed, so entries are grouped in 64-entry blocks with a skip table, and galloping
-runs over the skip table and decodes only the blocks it needs. Lists are encoded
-while indexing, so an uncompressed copy never exists and peak RSS drops too.
-
-**Sharding by document, with corpus-wide statistics.** `--shards N` splits the corpus
-into N contiguous ranges, cut at line boundaries in the file, and builds one `Index`
-per range on its own thread. No locks are needed because no thread touches another's
-index. Every query goes to every shard, and the per-shard top-k lists are merged. The
-subtle part is BM25: each shard only knows its own document counts, and scoring with
-those makes scores from different shards incomparable. So the coordinator sums each
-term's df across shards and hands every shard the corpus-wide idf and average length.
-Scores are also summed in a fixed term order, so sharded results are bit-identical to
-a single index. That's tested at up to 64 shards.
-
-**Parallel only when it pays.** Handing a query to other threads has a fixed cost, so
-cheap queries run on the shards one after another. Before touching any shard, the
-coordinator estimates the query's work from global dfs, the way a database planner
-does: candidates start at the rarest term's df and shrink by df/N per term, assuming
-terms occur independently. Shards run in parallel only above a threshold taken from a
-measured sweep. Each shard has a long-lived worker thread waiting on a channel;
-starting fresh threads per query cost ~39 µs, more than most queries take.
-
-**`explain` runs the real code path.** The query plan is recorded by the same function
-that answers normal searches, with tracing switched on, so it can't drift from what
-search actually does. With tracing off, that path never reads the clock.
-
-**The corpus generator is deterministic and Zipfian.** A fixed-seed xorshift64\* PRNG
-means the same corpus every run, because A/B benchmarks are meaningless if the input
-moves. The Zipfian distribution matters just as much: with uniformly sampled words
-every posting list would be the same length, and both BM25's IDF term and the
-intersection optimization would look pointless.
-
-**The engine is a library, not a `main.rs`.** A shard is just an `Index`, so sharding
-was a layer on top of the existing engine rather than a rewrite of it.
-
-**The benchmark was built before the optimizations**, not after. It groups queries by
-term frequency (common terms have long posting lists and behave nothing like rare
-ones), draws the same queries every run, warms the cache before timing, times
-sub-tick operations in batches, and wraps arguments and results in `black_box` so
-the optimizer can't delete work whose result is never used.
+- Queries start from the rarest word, since the result can't be bigger than its
+  list. Each step uses a merge or a galloping search depending on how different
+  the two lists are in length. The switch point (16x) came from measuring both.
+- Posting lists store the gaps between doc IDs as varints, in blocks of 64 with a
+  skip table, so a search can still jump ahead without decoding everything.
+- Shards split up the documents, not the words, so each shard can answer a query
+  on its own. BM25 needs word counts from the whole corpus, so those get added up
+  across shards first. Otherwise scores from different shards wouldn't match.
+  Results are the same as one unsharded index.
+- Small queries run one shard at a time, since handing them to other threads
+  costs more than it saves. Big ones run on all shards at once, each on its own
+  long-running worker thread.
+- The test corpus is generated with a fixed seed, so every benchmark run uses the
+  same data.
 
 ## Running it
 
 ```bash
-# Interactive REPL over the small hand-written corpus in documents/
-cargo run --release
-
-# Generate a 100K-document synthetic corpus (~104 MB, gitignored)
-cargo run --release --bin gencorpus -- 100000 corpus/docs.tsv
-
-# Benchmark: indexing throughput, query latency percentiles, peak RSS
-cargo run --release --bin bench -- corpus/docs.tsv
-
-# REPL over the generated corpus
-cargo run --release -- corpus/docs.tsv
-
-# Show the query plan: term order, which algorithm each step used and why, timings
-cargo run --release -- corpus/docs.tsv explain "aal clamshell aam abas"
-
-# Build 4 shards in parallel and search across them
-cargo run --release -- corpus/docs.tsv --shards 4
-
-# Benchmark sharded indexing and fan-out; --index-only just times the build
-cargo run --release --bin bench -- corpus/docs.tsv --shards 4
-cargo run --release --bin bench -- corpus/docs.tsv --shards 4 --index-only
-```
-
-Queries are ANDed and ranked by BM25. In the REPL, `:explain <query>` prints the plan:
-
-```
-QUERY PLAN  "aal clamshell aam abas"  over 100,000 docs
-
-Terms, rarest first (that's the execution order):
-  "clamshell"  df        34   idf  7.97
-  "abas"       df    18,144   idf  1.71
-  "aam"        df    95,989   idf  0.04
-  "aal"        df    99,972   idf  0.00
-
-Steps:
-  1. tokenize, look up and order 4 term(s), start from "clamshell": 34 candidates   0.67 µs
-  2. AND "abas": 34 vs 18,144, 533.6x >= 16x: gallop -> 5 left   3.88 µs
-  3. AND "aam": 5 vs 95,989, 19197.8x >= 16x: gallop -> 4 left   0.71 µs
-  4. AND "aal": 4 vs 99,972, 24993.0x >= 16x: gallop -> 4 left   0.58 µs
-  5. BM25-score 4 match(es), sort them all   2.00 µs
-
-Total 7.83 µs: 4 matched, returning 4.
+cargo run --release --bin gencorpus -- 100000 corpus/docs.tsv    # generate the corpus
+cargo run --release -- corpus/docs.tsv --shards 4                 # search it
+cargo run --release -- corpus/docs.tsv explain "aal clamshell"    # show a query's plan
+cargo run --release --bin bench -- corpus/docs.tsv --shards 4     # benchmarks
 ```
 
 ## Layout
 
 ```
-src/lib.rs           crate root: module list and public API
-src/index.rs         Index: term dictionary, add_document, the query path, loaders
-src/postings.rs      compressed posting lists (delta + varint blocks, skip table)
-src/intersect.rs     merge / galloping intersection and the rule choosing between them
-src/rank.rs          BM25 pieces and top-k selection
-src/shard.rs         ShardedIndex: parallel build, worker pool, global stats, merge
-src/tokenize.rs      allocation-free tokenizer
-src/hash.rs          FxHash
-src/explain.rs       query plans for `explain`
-src/main.rs          interactive search REPL and `explain` command
-src/bin/gencorpus.rs deterministic Zipfian corpus generator
-src/bin/bench.rs     benchmark harness (throughput, latency percentiles, peak RSS)
-documents/           small hand-written corpus for sanity checks
-BENCHMARKS.md        every version's numbers, in order
+src/index.rs       the index and the query path
+src/postings.rs    compressed posting lists
+src/intersect.rs   merge and galloping search
+src/rank.rs        BM25 and top-k
+src/shard.rs       shards, worker threads, merging results
+src/tokenize.rs    tokenizer
+src/hash.rs        FxHash
+src/explain.rs     query plans
+src/main.rs        the search REPL
+src/bin/bench.rs   benchmarks
 ```
