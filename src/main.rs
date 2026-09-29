@@ -1,14 +1,4 @@
-//! Interactive search REPL.
-//!
-//! Usage:
-//!   cargo run --release                           -> indexes ./documents/*.txt
-//!   cargo run --release -- corpus/docs.tsv        -> indexes a corpus file
-//!   cargo run --release -- corpus/docs.tsv --shards 4
-//!                                                 -> 4 shards, built in parallel
-//!   cargo run --release -- [path] explain <query> -> print one query's plan
-//!
-//! In the REPL, `:explain <query>` prints the plan instead of just results.
-//! --shards applies to .tsv corpora; a directory is always one shard.
+//! Search REPL: `recall [corpus.tsv | dir] [--shards N] [explain <query>]`. Type `:explain <query>` at the prompt for a plan.
 
 use recall::{Index, Ranked, ShardedIndex};
 use std::io::{self, Write};
@@ -36,8 +26,7 @@ fn print_results(index: &ShardedIndex, results: &Ranked) {
 }
 
 fn explain(index: &ShardedIndex, query: &str) {
-    // A plan describes one index's execution. With one shard that index is
-    // the whole corpus, so its plan and statistics are exactly the query's.
+    // A plan describes a single index, so this needs one shard.
     let [shard] = index.shards() else {
         println!("explain describes a single index; run without --shards to use it.");
         return;
@@ -64,7 +53,7 @@ fn main() -> io::Result<()> {
         };
         args.drain(i..i + 2);
     }
-    // `[path] explain <query...>`: everything after "explain" is the query.
+    // Everything after `explain` is the query.
     let (path, one_shot) = match args.iter().position(|a| a == "explain") {
         Some(i) => (args[..i].first(), Some(args[i + 1..].join(" "))),
         None => (args.first(), None),
@@ -91,7 +80,7 @@ fn main() -> io::Result<()> {
 
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
-            break; // Ctrl-D
+            break;
         }
 
         let line = line.trim();

@@ -1,18 +1,4 @@
-//! Generates a synthetic corpus so we have something big enough to measure.
-//!
-//! Usage: cargo run --release --bin gencorpus -- <num_docs> <out_path>
-//!
-//! Two design choices worth understanding:
-//!
-//! 1. DETERMINISTIC. A hand-rolled xorshift PRNG with a fixed seed means the
-//!    same corpus every run. Benchmarks comparing version A to version B are
-//!    meaningless if the input changed underneath you.
-//!
-//! 2. ZIPFIAN word distribution. Real text is wildly skewed: "the" appears in
-//!    every document, "photosynthesis" in a handful. If we picked words
-//!    uniformly, every posting list would be the same length and both BM25's
-//!    IDF term and the intersection optimization would look pointless. Zipf's
-//!    law (frequency proportional to 1/rank) reproduces the real skew.
+//! Generates a test corpus: `gencorpus <num_docs> <out_path>`. Fixed seed, Zipf word frequencies.
 
 use std::env;
 use std::fs::File;
@@ -90,8 +76,7 @@ fn main() -> io::Result<()> {
         let len = rng.next_range(60, 200); // words per document
         write!(out, "doc{id:07}.txt\t")?;
         for i in 0..len {
-            // Inverse-transform sampling: pick a uniform value, binary search
-            // the CDF to find which rank it lands in.
+            // Pick a word by binary searching the CDF with a random number.
             let u = rng.next_f64();
             let rank = cdf.partition_point(|&c| c < u).min(vocab.len() - 1);
             if i > 0 {

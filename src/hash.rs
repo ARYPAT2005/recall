@@ -1,11 +1,8 @@
-//! FxHash, a fast non-cryptographic hasher for the term dictionary.
+//! FxHash, a fast hash function for the term dictionary.
 
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// FxHash, the hasher rustc uses internally: one rotate, xor and multiply per
-/// 8 bytes. The std default (SipHash) is built to resist HashDoS from
-/// attacker-chosen keys, which costs several times more per short key. Our
-/// keys come from our own corpus, so that protection buys nothing here.
+/// Faster than std's default SipHash on short keys like words.
 #[derive(Default, Clone, Copy)]
 pub struct FxHasher {
     hash: u64,
@@ -41,8 +38,7 @@ impl Hasher for FxHasher {
 
     #[inline]
     fn finish(&self) -> u64 {
-        // The multiply leaves the best-mixed bits at the top, but hashbrown
-        // picks buckets from the bottom bits. Rotating brings them down.
+        // Move the well-mixed high bits down to where the hash table looks.
         self.hash.rotate_left(26)
     }
 }

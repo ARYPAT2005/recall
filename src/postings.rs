@@ -1,16 +1,13 @@
-//! Compressed posting lists: blocked delta + varint encoding with a skip table.
+//! Compressed posting lists.
 
 use crate::intersect::{gallop_by, gallop_to};
 use crate::{DocId, Strategy};
 use std::cmp::Ordering;
 
-/// Entries per compressed block. See PostingList. Smaller blocks mean less to
-/// decode per lookup but more skip-table entries. Measured against 128 and
-/// 256: 64 makes rare-in-long-list lookups 30-45% faster for 2% more bytes.
+/// Entries per compressed block.
 pub const BLOCK: usize = 64;
 
-/// Append `v` as a LEB128 varint: 7 bits per byte, high bit set on every
-/// byte but the last. Values under 128 take one byte, under 16,384 two.
+/// LEB128: 7 bits per byte, high bit set if more bytes follow.
 fn write_varint(out: &mut Vec<u8>, mut v: u32) {
     while v >= 0x80 {
         out.push(v as u8 | 0x80);
@@ -19,6 +16,7 @@ fn write_varint(out: &mut Vec<u8>, mut v: u32) {
     out.push(v as u8);
 }
 
+/// Reads one varint at `pos` and moves `pos` past it.
 #[inline]
 fn read_varint(bytes: &[u8], pos: &mut usize) -> u32 {
     let mut value = 0u32;
@@ -34,35 +32,20 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> u32 {
     }
 }
 
-/// One term's postings: the documents containing it, ascending, and how many
-/// times the term occurs in each (term frequency, which BM25 needs).
-///
-/// Stored compressed. Doc ids are replaced by the gap from the previous id,
-/// and gaps and term frequencies are written as varints - most gaps and
-/// nearly all tfs fit in one byte instead of four. Deltas alone would save
-/// nothing if each gap still took a u32; the varint is what shrinks them.
-///
-/// Varints can't be indexed, which would kill galloping. So entries are
-/// grouped into blocks of BLOCK, and a skip table holds each block's first
-/// doc id and byte offset: search gallops over the skip table and decodes
-/// only the blocks that can contain what it's looking for.
-///
-/// Search code only goes through these methods, never the raw bytes.
+/// One term's doc ids and counts: gaps and counts as varints, in blocks with a skip table.
 #[derive(Default)]
 pub struct PostingList {
     len: u32,
-    /// The previous doc id appended: the base for the next gap.
+    // previous doc id added, the base for the next gap
     last: DocId,
-    /// Per block: (first doc id, byte offset of the block in `bytes`).
+    // per block: (first doc id, byte offset)
     skips: Vec<(DocId, u32)>,
-    /// Per entry: varint(gap from previous doc in the block), varint(tf).
-    /// A block's first gap is from the block's own first id, so it's 0 and
-    /// the block decodes without looking at the one before it.
+    // per entry: varint gap, varint count
     bytes: Vec<u8>,
 }
 
 impl PostingList {
-    /// Document frequency: how many documents contain the term.
+    /// Number of documents containing the term.
     pub fn len(&self) -> usize {
         self.len as usize
     }
@@ -71,11 +54,10 @@ impl PostingList {
         self.len == 0
     }
 
-    /// Append a document and the term's count in it. Docs arrive in
-    /// ascending id order, once each, so the list stays sorted and deduped
-    /// - which is exactly what intersection needs.
+    /// Adds a document. Ids must be increasing.
     pub(crate) fn push(&mut self, id: DocId, tf: u32) {
         debug_assert!(self.len == 0 || id > self.last, "doc ids must ascend");
+        // Start a new block.
         if self.len().is_multiple_of(BLOCK) {
             self.skips.push((id, self.bytes.len() as u32));
             self.last = id;
@@ -86,7 +68,7 @@ impl PostingList {
         self.len += 1;
     }
 
-    /// Decode block `b` into the front of `docs` and `tfs`; returns its length.
+    /// Decodes block `b` into `docs` and `tfs` and returns how many entries it had.
     fn decode_block(&self, b: usize, docs: &mut [DocId; BLOCK], tfs: &mut [u32; BLOCK]) -> usize {
         let n = (self.len() - b * BLOCK).min(BLOCK);
         let (mut doc, offset) = self.skips[b];
@@ -99,7 +81,7 @@ impl PostingList {
         n
     }
 
-    /// Every doc id, ascending.
+    /// All doc ids, decoded.
     pub fn doc_ids(&self) -> Vec<DocId> {
         let mut out = Vec::with_capacity(self.len());
         let (mut docs, mut tfs) = ([0; BLOCK], [0; BLOCK]);
@@ -110,7 +92,7 @@ impl PostingList {
         out
     }
 
-    /// The ids in `candidates` (sorted) that this list also contains.
+    /// The ids in `candidates` that are also in this list.
     pub fn intersect(&self, candidates: &[DocId], strategy: Strategy) -> Vec<DocId> {
         match strategy.resolve(candidates.len(), self.len()) {
             Strategy::Merge => self.intersect_merge(candidates),
@@ -125,7 +107,7 @@ impl PostingList {
         }
     }
 
-    /// Decode every block in order and merge against the candidates.
+    /// Decodes every block and merges.
     fn intersect_merge(&self, candidates: &[DocId]) -> Vec<DocId> {
         let mut out = Vec::with_capacity(candidates.len().min(self.len()));
         let (mut docs, mut tfs) = ([0; BLOCK], [0; BLOCK]);
@@ -151,8 +133,7 @@ impl PostingList {
         out
     }
 
-    /// Term frequency in each of `docs`, which must all be in this list - they
-    /// are the output of intersecting with it.
+    /// The term's count in each of `docs`. Every doc must be in the list.
     pub fn tfs_for(&self, docs: &[DocId], out: &mut Vec<u32>) {
         out.clear();
         let mut cursor = Cursor::new(self);
@@ -161,7 +142,7 @@ impl PostingList {
         }
     }
 
-    /// Heap bytes: (holding entries, allocated including unused capacity).
+    /// (bytes used, bytes allocated).
     pub fn heap_bytes(&self) -> (usize, usize) {
         let skip = std::mem::size_of::<(DocId, u32)>();
         (
@@ -171,8 +152,7 @@ impl PostingList {
     }
 }
 
-/// Forward-only reader over a PostingList for ascending lookups. Keeps the
-/// current block decoded, so consecutive lookups in one block decode it once.
+/// Walks a list forward, keeping the current block decoded.
 struct Cursor<'a> {
     list: &'a PostingList,
     block: Option<usize>,
@@ -187,16 +167,12 @@ impl<'a> Cursor<'a> {
         Cursor { list, block: None, pos: 0, n: 0, docs: [0; BLOCK], tfs: [0; BLOCK] }
     }
 
-    /// If `id` is in the list, its term frequency. Each call's id must be
-    /// greater than the previous call's.
+    /// The count for `id` if it's in the list. Ids must increase between calls.
     fn find(&mut self, id: DocId) -> Option<u32> {
-        // The block that could hold id is the last one starting at or before
-        // it. Gallop over the skip table from the current block: the next
-        // id is usually in this block or close after it.
         let from = self.block.unwrap_or(0);
         let k = gallop_by(&self.list.skips[from..], |&(first, _)| first <= id);
         if k == 0 {
-            return None; // id comes before every block from here on
+            return None;
         }
         let b = from + k - 1;
         if self.block != Some(b) {
@@ -214,7 +190,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// What an unknown query term resolves to. See `Index::matching`.
+/// Empty list used for words that aren't in the index.
 pub(crate) static NO_POSTINGS: PostingList = PostingList {
     len: 0,
     last: 0,
@@ -234,7 +210,6 @@ mod tests {
         for &v in &values {
             write_varint(&mut bytes, v);
         }
-        // 1 + 1 + 1 + 2 + 2 + 3 + 3 + 4 + 5 bytes
         assert_eq!(bytes.len(), 22);
         let mut pos = 0;
         for &v in &values {
@@ -243,8 +218,6 @@ mod tests {
         assert_eq!(pos, bytes.len());
     }
 
-    /// A list of `n` entries with gaps from tiny to huge (5-byte varints) and
-    /// assorted tfs, plus the raw (docs, tfs) it should decode to.
     fn compressed(n: usize, seed: u64) -> (PostingList, Vec<DocId>, Vec<u32>) {
         let mut state = seed;
         let mut next = move || {
@@ -259,7 +232,7 @@ mod tests {
             docs.push(doc);
             tfs.push(1 + (next() % 3 == 0) as u32 * (next() % 300) as u32);
             let gap = match next() % 20 {
-                0 => 1 + next() % 5_000_000, // multi-byte varint
+                0 => 1 + next() % 5_000_000,
                 1..=9 => 1,
                 _ => 1 + next() % 100,
             };
@@ -284,7 +257,6 @@ mod tests {
             let mut got = Vec::new();
             list.tfs_for(&docs, &mut got);
             assert_eq!(got, tfs);
-            // A sparse subset: every 37th entry, so lookups skip blocks.
             let subset: Vec<DocId> = docs.iter().step_by(37).copied().collect();
             let want: Vec<u32> = tfs.iter().step_by(37).copied().collect();
             list.tfs_for(&subset, &mut got);
@@ -298,8 +270,6 @@ mod tests {
         let max = *docs.last().unwrap();
         let mut state = 7u64;
         for density in [1u64, 10, 100, 1_000, 10_000] {
-            // Candidates: some in the list, some between its ids, some past
-            // either end.
             let mut cands: Vec<DocId> = docs
                 .iter()
                 .filter(|_| {

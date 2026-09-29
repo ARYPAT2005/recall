@@ -1,51 +1,39 @@
-//! `explain`: what the engine did for one query, and why.
-//!
-//! A Plan is filled in by the same code path that answers real queries
-//! (`Index::matching` with tracing on), so it can't drift from what search
-//! actually does. With tracing off that path takes no timestamps at all.
+//! Query plans for `explain`.
 
 use crate::{Hit, Strategy, GALLOP_RATIO};
 use std::fmt;
 use std::time::Duration;
 
-/// One query term as the planner saw it.
+/// A query word as the planner saw it (df 0 means it's not in the index).
 #[derive(Debug, Clone)]
 pub struct PlanTerm {
     pub term: String,
-    /// Document frequency. 0 means the term isn't in the index.
     pub df: usize,
     pub idf: f32,
 }
 
-/// One intersection: the running candidates against the next term's list.
+/// One intersection step.
 #[derive(Debug, Clone)]
 pub struct PlanStep {
     pub term: String,
-    /// Candidates going in (always the shorter side).
     pub candidates: usize,
-    /// Length of the term's posting list.
     pub df: usize,
-    /// What Adaptive resolved to: Merge or Gallop.
     pub algorithm: Strategy,
-    /// Candidates left afterwards.
     pub matched: usize,
     pub time: Duration,
 }
 
+/// Everything that happened when a query ran.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub query: String,
     pub num_docs: usize,
-    /// Distinct query terms in execution order, rarest first.
     pub terms: Vec<PlanTerm>,
-    /// Tokenizing, deduping, looking up and ordering the terms.
     pub lookup_time: Duration,
-    /// Intersections, in order. Fewer than terms - 1 if candidates ran out.
     pub steps: Vec<PlanStep>,
     pub matched: usize,
     pub k: usize,
     pub hits: Vec<Hit>,
-    /// Scoring every match with BM25 and selecting the top k.
     pub rank_time: Duration,
 }
 
@@ -120,8 +108,7 @@ impl fmt::Display for Plan {
             )?;
         }
 
-        // Candidates ran out before every term was used: the rest were
-        // never touched. Say so, since that's the payoff of rarest-first.
+        // Words never read because the candidates ran out first.
         let skipped = &self.terms[1 + self.steps.len()..];
         if !skipped.is_empty() {
             let names: Vec<String> = skipped.iter().map(|t| format!("{:?}", t.term)).collect();

@@ -1,5 +1,4 @@
-//! The single-threaded index: term dictionary, posting lists, document
-//! metadata, and the query path. A shard is one of these.
+//! One index: term dictionary, posting lists and the query path.
 
 use crate::hash::FxBuildHasher;
 use crate::postings::{PostingList, NO_POSTINGS};
@@ -12,21 +11,19 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Instant;
 
+/// An inverted index over a set of documents. A shard is one of these.
 #[derive(Default)]
 pub struct Index {
-    /// Term -> its id, an index into `lists`.
+    // word -> term id
     term_ids: HashMap<String, u32, FxBuildHasher>,
-    /// The inverted index: term id -> its posting list.
+    // term id -> posting list
     lists: Vec<PostingList>,
-    /// Scratch for add_document: the current doc's count for each term id,
-    /// and which ids it has touched. Kept here so no doc allocates them.
+    // scratch space for add_document
     pending_tf: Vec<u32>,
     touched: Vec<u32>,
-    /// doc_names[id] -> the filename or title
     pub doc_names: Vec<String>,
-    /// doc_lens[id] -> token count, for BM25's length normalization.
+    // words per document, for BM25
     pub doc_lens: Vec<u32>,
-    /// Sum of doc_lens, so avg_doc_len is O(1) on the query path.
     total_len: u64,
 }
 
@@ -43,13 +40,11 @@ impl Index {
         self.lists.len()
     }
 
-    /// Total entries across all posting lists - the real size driver.
     pub fn num_postings(&self) -> usize {
         self.lists.iter().map(|l| l.len()).sum()
     }
 
-    /// Heap bytes held by all posting lists (not the term strings or table):
-    /// (holding entries, allocated including unused capacity).
+    /// (bytes used, bytes allocated) across all posting lists.
     pub fn posting_bytes(&self) -> (usize, usize) {
         self.lists
             .iter()
@@ -57,7 +52,6 @@ impl Index {
             .fold((0, 0), |(u, a), (lu, la)| (u + lu, a + la))
     }
 
-    /// Average document length in tokens. BM25 needs this.
     pub fn avg_doc_len(&self) -> f64 {
         if self.doc_lens.is_empty() {
             return 0.0;
@@ -65,24 +59,19 @@ impl Index {
         self.total_len as f64 / self.doc_lens.len() as f64
     }
 
-    /// Every term with its posting list, in no particular order.
     pub fn terms(&self) -> impl Iterator<Item = (&str, &PostingList)> {
         self.term_ids.iter().map(|(t, &id)| (t.as_str(), &self.lists[id as usize]))
     }
 
+    /// Indexes one document and returns its id.
     pub fn add_document(&mut self, name: String, text: &str) -> DocId {
         let id = self.doc_names.len() as DocId;
         let Index { term_ids, lists, pending_tf, touched, .. } = self;
         let mut len = 0u32;
 
-        // Count each term in this doc first, then append one (doc, tf) entry
-        // per distinct term. Compressed lists are append-only, so a repeat
-        // can't go back and bump a tf that's already been encoded.
+        // Count each word first, then append one entry per word, since encoded lists can't be edited.
         for_each_token(text, &mut String::new(), |word| {
             len += 1;
-            // get first: entry() needs an owned String key, which would
-            // allocate once per token even though nearly every term already
-            // exists. Only a brand-new term pays for the allocation.
             let term = match term_ids.get(word) {
                 Some(&term) => term,
                 None => {
@@ -111,34 +100,27 @@ impl Index {
         id
     }
 
-    /// The posting list for one term, if any document contains it.
     pub fn postings_for(&self, term: &str) -> Option<&PostingList> {
         self.term_ids.get(term).map(|&id| &self.lists[id as usize])
     }
 
-    /// Boolean AND: documents containing every term in the query, ascending.
-    /// The query goes through the same tokenizer as the documents, so "Machine
-    /// Learning!" and "machine learning" are the same search.
+    /// Doc ids that contain every word in the query.
     pub fn search(&self, query: &str) -> Vec<DocId> {
         self.search_with(query, Strategy::Adaptive)
     }
 
+    /// `search` with a fixed intersection strategy, for benchmarking.
     pub fn search_with(&self, query: &str, strategy: Strategy) -> Vec<DocId> {
         self.matching(&self.weigh(query), strategy, None).1
     }
 
-    /// The k most relevant documents containing every query term, by BM25.
+    /// The k best matches, ranked by BM25.
     pub fn search_ranked(&self, query: &str, k: usize) -> Ranked {
         self.rank_terms(&self.weigh(query), self.avg_doc_len() as f32, k)
     }
 
-    /// Run a ranked query and report every decision the engine made: term
-    /// order, each intersection's algorithm and why, and where time went.
+    /// Runs a query and records every step. Runs it twice and keeps the warm run.
     pub fn explain(&self, query: &str, k: usize) -> Plan {
-        // Run it once and throw that plan away. The first run pays one-time
-        // costs - cold posting lists, and the process's first clock read,
-        // which on macOS resolves the timer symbol lazily (~13 µs) - that
-        // would otherwise land on whichever step happens to go first.
         self.explain_once(query, k);
         self.explain_once(query, k)
     }
@@ -162,13 +144,11 @@ impl Index {
         plan
     }
 
-    /// The query's terms weighted by this index's own statistics.
     fn weigh(&self, query: &str) -> Vec<QueryTerm> {
         weigh(query, self.num_docs(), |t| self.postings_for(t).map_or(0, |l| l.len()))
     }
 
-    /// BM25 top-k for already-weighted terms. A shard is called this way, with
-    /// idfs and avg_len computed over the whole corpus instead of just itself.
+    /// BM25 top k using the stats in `terms`. Shards get corpus-wide stats here.
     pub(crate) fn rank_terms(&self, terms: &[QueryTerm], avg_len: f32, k: usize) -> Ranked {
         let (lists, docs) = self.matching(terms, Strategy::Adaptive, None);
         self.rank(terms, &lists, &docs, avg_len, k)
@@ -190,9 +170,7 @@ impl Index {
         }
     }
 
-    /// Each term's posting list (in `terms` order) and the docs in all of
-    /// them. With `plan`, also records each decision and its timing - the only
-    /// time this path reads the clock.
+    /// Each term's posting list, and the docs that are in all of them.
     fn matching(
         &self,
         terms: &[QueryTerm],
@@ -200,19 +178,13 @@ impl Index {
         mut plan: Option<&mut Plan>,
     ) -> (Vec<&PostingList>, Vec<DocId>) {
         let started = plan.is_some().then(Instant::now);
-        // An unknown term gets an empty list instead of a special case: it
-        // sorts first as the rarest term, and the intersection comes out
-        // empty, which is exactly what AND means.
+        // Unknown words get an empty list, so the AND comes out empty.
         let lists: Vec<&PostingList> = terms
             .iter()
             .map(|t| self.postings_for(&t.term).unwrap_or(&NO_POSTINGS))
             .collect();
 
-        // Execute shortest first: the result can never outgrow the shortest
-        // list, so starting there bounds every later intersection by the
-        // rarest term instead of dragging the longest list through each step.
-        // A shard orders by its own list lengths, which is what its own work
-        // depends on. The sort is stable, so ties keep the given order.
+        // Rarest first: the result can never be bigger than the shortest list.
         let mut order: Vec<usize> = (0..lists.len()).collect();
         order.sort_by_key(|&i| lists[i].len());
 
@@ -254,15 +226,7 @@ impl Index {
         (lists, docs)
     }
 
-    /// BM25 score for each of `docs`, which contain every term in `lists`:
-    ///
-    ///   sum over terms of  idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg_len))
-    ///
-    /// tf saturates (k1 caps what repetition adds), and a doc longer than
-    /// average needs more occurrences for the same score (b). Terms are added
-    /// in `terms` order, never execution order: float addition isn't
-    /// associative, and a fixed order is what lets shards reproduce a single
-    /// index's scores exactly.
+    /// BM25 score for each doc. Terms are added in a fixed order so shards match a single index exactly.
     fn score(
         &self,
         terms: &[QueryTerm],
@@ -270,8 +234,6 @@ impl Index {
         docs: &[DocId],
         avg_len: f32,
     ) -> Vec<f32> {
-        // The length part of the denominator depends only on the doc, so
-        // compute it once per doc rather than once per (doc, term).
         let norms: Vec<f32> = docs
             .iter()
             .map(|&d| {
@@ -292,14 +254,14 @@ impl Index {
         scores
     }
 
-    /// Index every .txt file in a directory. Good for small hand-written corpora.
+    /// Indexes every .txt file in a directory.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> io::Result<Index> {
         let mut idx = Index::new();
         let mut paths: Vec<_> = fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("txt"))
             .collect();
-        paths.sort(); // stable doc ids across runs
+        paths.sort();
 
         for path in paths {
             let text = fs::read_to_string(&path)?;
@@ -309,17 +271,12 @@ impl Index {
         Ok(idx)
     }
 
-    /// Index a corpus file: one document per line, `title<TAB>body`.
-    ///
-    /// 100K separate files would mean 100K `open`/`close` syscalls and a lot of
-    /// wasted inodes. One file read sequentially is dramatically faster and is
-    /// how real corpora ship.
+    /// Indexes a corpus file with one `title<TAB>body` document per line.
     pub fn from_corpus_file<P: AsRef<Path>>(path: P) -> io::Result<Index> {
         Index::from_corpus_range(path.as_ref(), 0, u64::MAX)
     }
 
-    /// Index the lines in bytes [start, end) of a corpus file. `start` must be
-    /// the start of a line; a shard's thread reads just its own slice.
+    /// Same, but only the lines in bytes [start, end).
     pub fn from_corpus_range(path: &Path, start: u64, end: u64) -> io::Result<Index> {
         let mut idx = Index::new();
         let mut file = File::open(path)?;
@@ -337,29 +294,25 @@ impl Index {
         Ok(idx)
     }
 
-    /// Sum of all document lengths, for corpus-wide averages across shards.
     pub(crate) fn total_len(&self) -> u64 {
         self.total_len
     }
 }
 
-/// A query term, its document frequency, and the idf it's scored with.
+/// A query word with its document frequency and idf.
 pub(crate) struct QueryTerm {
     pub term: String,
     pub df: usize,
     pub idf: f32,
 }
 
-/// Tokenize and dedupe a query ("rust rust" is one term; scoring it twice
-/// would double its weight), then order the terms by (df, term) and give
-/// each its idf, from whichever statistics the caller passes: an index's own,
-/// or the whole corpus's when the index is one shard of it.
+/// Tokenizes and dedupes a query, orders the words by df and works out each idf.
 pub(crate) fn weigh(query: &str, num_docs: usize, df: impl Fn(&str) -> usize) -> Vec<QueryTerm> {
     let mut terms = tokenize(query);
     terms.sort_unstable();
     terms.dedup();
     let mut with_df: Vec<(usize, String)> = terms.into_iter().map(|t| (df(&t), t)).collect();
-    with_df.sort_by_key(|&(df, _)| df); // stable: equal dfs stay alphabetical
+    with_df.sort_by_key(|&(df, _)| df);
     with_df
         .into_iter()
         .map(|(df, term)| QueryTerm {
@@ -414,18 +367,14 @@ mod tests {
     fn term_frequencies_are_counted_per_doc() {
         let idx = sample();
         let list = idx.postings_for("learning").unwrap();
-        assert_eq!(list.len(), 3); // df counts documents, not occurrences
+        assert_eq!(list.len(), 3);
         let mut tfs = Vec::new();
         list.tfs_for(&[0, 2, 3], &mut tfs);
-        assert_eq!(tfs, vec![1, 2, 1]); // doc c says "learning" twice
+        assert_eq!(tfs, vec![1, 2, 1]);
     }
 
     #[test]
     fn bm25_matches_hand_computed_score() {
-        // N = 2, df(rust) = 1, avg_len = 1.5, doc 0 has len 1 and tf 1.
-        // idf  = ln(1 + (2 - 1 + 0.5) / (1 + 0.5)) = ln 2
-        // norm = 1.2 * (1 - 0.75 + 0.75 * 1 / 1.5) = 0.9
-        // score = ln 2 * 1 * 2.2 / (1 + 0.9)
         let idx = index(&["rust", "go go"]);
         let hits = idx.search_ranked("rust", 10).hits;
         let expected = 2f32.ln() * 2.2 / 1.9;
@@ -435,18 +384,14 @@ mod tests {
 
     #[test]
     fn bm25_rewards_term_frequency_and_short_docs() {
-        // More occurrences in docs of equal length ranks higher...
         let idx = index(&["rust go go", "rust rust go"]);
         assert_eq!(ranked_ids(&idx, "rust"), vec![1, 0]);
-        // ...and the same count in a shorter doc ranks higher.
         let idx = index(&["rust a b c d e", "rust a"]);
         assert_eq!(ranked_ids(&idx, "rust"), vec![1, 0]);
     }
 
     #[test]
     fn bm25_weights_rare_terms_more() {
-        // "machine" is in 3 docs, "rust" in 2. Docs 0 and 1 both match the
-        // query with the same length; doc 1 has more of the rarer term.
         let idx = index(&["machine machine rust", "machine rust rust", "machine"]);
         assert_eq!(ranked_ids(&idx, "machine rust"), vec![1, 0]);
     }
@@ -456,7 +401,6 @@ mod tests {
         let idx = index(&["rust", "rust", "rust rust", "rust"]);
         let r = idx.search_ranked("rust", 2);
         assert_eq!(r.matched, 4);
-        // Doc 2 scores highest; docs 0, 1 and 3 tie, and the lowest id wins.
         assert_eq!(r.hits.iter().map(|h| h.doc).collect::<Vec<_>>(), vec![2, 0]);
         assert!(idx.search_ranked("rust", 0).hits.is_empty());
     }
@@ -474,12 +418,11 @@ mod tests {
     fn explain_reports_order_steps_and_same_results_as_search() {
         let idx = sample();
         let plan = idx.explain("machine learning rust", 10);
-        // rust (df 2) first; learning and machine (df 3) tie, alphabetical.
         let order: Vec<&str> = plan.terms.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(order, vec!["rust", "learning", "machine"]);
         assert_eq!(plan.steps.len(), 2);
         assert_eq!((plan.steps[0].candidates, plan.steps[0].df), (2, 3));
-        assert_eq!(plan.steps[0].algorithm, Strategy::Merge); // 1.5x < 16x
+        assert_eq!(plan.steps[0].algorithm, Strategy::Merge);
         assert_eq!(plan.hits, idx.search_ranked("machine learning rust", 10).hits);
         assert_eq!(plan.matched, 1);
     }
@@ -489,7 +432,7 @@ mod tests {
         let mut docs = vec!["common rare"];
         docs.extend(std::iter::repeat_n("common", 40));
         let plan = index(&docs).explain("common rare", 10);
-        assert_eq!(plan.steps[0].algorithm, Strategy::Gallop); // 41 vs 1
+        assert_eq!(plan.steps[0].algorithm, Strategy::Gallop);
         assert!(plan.to_string().contains("gallop"));
     }
 
@@ -498,7 +441,7 @@ mod tests {
         let plan = sample().explain("machine zebra learning", 10);
         assert_eq!(plan.terms[0].term, "zebra");
         assert_eq!(plan.terms[0].df, 0);
-        assert!(plan.steps.is_empty()); // nothing left to intersect
+        assert!(plan.steps.is_empty());
         assert_eq!(plan.matched, 0);
         assert!(plan.to_string().contains("never read"));
     }

@@ -1,20 +1,11 @@
-//! The benchmark harness. This is the tool that turns the project into resume
-//! bullets, so it gets built BEFORE the optimizations, not after.
-//!
-//! Usage: cargo run --release --bin bench -- [corpus_path] [--shards N] [--index-only]
-//!
-//! Reports: indexing throughput, query latency percentiles, peak memory.
-//! With --shards N > 1, builds N shards in parallel and measures fan-out.
-//! --index-only times the build 5 times and stops: parallel builds are
-//! sensitive to background load, so one run isn't enough.
+//! Benchmarks: `bench [corpus] [--shards N] [--index-only]`. Indexing speed, query latency and memory.
 
 use recall::{FanOut, Index, PostingList, ShardedIndex, Strategy};
 use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant};
 
-/// Peak resident set size in bytes, straight from the kernel via getrusage(2).
-/// macOS reports ru_maxrss in bytes; Linux reports kilobytes.
+/// Peak memory from getrusage (bytes on macOS, KB on Linux).
 fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
@@ -41,12 +32,9 @@ fn human_bytes(n: u64) -> String {
     format!("{v:.1} {}", UNITS[u])
 }
 
-/// Runs one query, returns how many documents matched.
 type QueryFn<'a> = dyn Fn(&str) -> usize + 'a;
 
-/// Average nanoseconds per call. Runs in batches long enough (~2 ms) that
-/// timer resolution doesn't matter, and takes the fastest batch to shed noise
-/// from interrupts and frequency scaling.
+/// Average ns per call, timed in ~2 ms batches, fastest of 7.
 fn time_ns<R>(mut f: impl FnMut() -> R) -> f64 {
     let t = Instant::now();
     std::hint::black_box(f());
@@ -63,7 +51,7 @@ fn time_ns<R>(mut f: impl FnMut() -> R) -> f64 {
     best
 }
 
-/// Percentile from an already-sorted slice, using nearest-rank.
+/// Nearest-rank percentile of a sorted slice.
 fn pct(sorted: &[Duration], p: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
@@ -74,17 +62,13 @@ fn pct(sorted: &[Duration], p: f64) -> Duration {
 
 const Q_ITERS: usize = 5_000;
 
-/// Terms with document frequencies, most frequent first. Ties are broken by
-/// term: HashMap iteration order is randomly seeded, so sorting on df alone
-/// would draw different queries every run.
+/// Terms by df, most common first. Ties sorted by term so every run picks the same queries.
 fn by_df(mut terms: Vec<(&str, usize)>) -> Vec<(&str, usize)> {
     terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     terms
 }
 
-/// Query classes, 500 fixed queries each. Terms are bucketed by rank in the
-/// frequency ordering; classes mix buckets because common+rare is where the
-/// algorithms differ most.
+/// 500 fixed queries per class, mixing common, mid and rare words.
 fn query_classes(terms: &[(&str, usize)]) -> Vec<(&'static str, Vec<String>)> {
     let rank_range = |lo: f64, hi: f64| -> Vec<&str> {
         let n = terms.len() as f64;
@@ -93,7 +77,7 @@ fn query_classes(terms: &[(&str, usize)]) -> Vec<(&'static str, Vec<String>)> {
             .map(|&(t, _)| t)
             .collect()
     };
-    let common = rank_range(0.0, 0.002); // top 100 terms
+    let common = rank_range(0.0, 0.002);
     let mid = rank_range(0.02, 0.1);
     let rare = rank_range(0.3, 0.6);
 
@@ -114,7 +98,7 @@ fn query_classes(terms: &[(&str, usize)]) -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
-/// Times `run` over the class's queries; `run` returns the hit count.
+/// Times each query; returns sorted latencies and the average number of matches.
 fn measure(queries: &[String], run: &QueryFn) -> (Vec<Duration>, f64) {
     for q in queries.iter().take(100) {
         std::hint::black_box(run(q));
@@ -163,7 +147,6 @@ fn print_indexing(corpus: &str, docs: usize, terms: usize, postings: usize, avg_
 fn print_memory((used, allocated): (usize, usize), postings: usize) {
     println!("\n== Memory ==");
     println!("  peak RSS        {}", human_bytes(peak_rss_bytes()));
-    // "used" is what the entries occupy; "allocated" adds Vec growth space.
     for (label, bytes) in [("used", used), ("allocated", allocated)] {
         println!(
             "  postings {label:<9} {} ({:.2} bytes/posting)",
@@ -217,7 +200,6 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run_single(corpus: &str) -> std::io::Result<()> {
-    // ---------- Indexing ----------
     let t0 = Instant::now();
     let index = Index::from_corpus_file(corpus)?;
     let index_time = t0.elapsed();
@@ -226,11 +208,6 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
     println!("== Indexing ==");
     print_indexing(corpus, index.num_docs(), index.num_terms(), postings, index.avg_doc_len(), index_time);
 
-    // ---------- Query latency ----------
-    // Draw query terms from the index itself, so we measure realistic lookups
-    // rather than a pile of misses. Sample across the frequency spectrum:
-    // common terms (long posting lists) and rare ones (short) behave very
-    // differently, and an average over only rare terms would flatter us.
     let terms = by_df(index.terms().map(|(t, l)| (t, l.len())).collect());
 
     let sample: Vec<&str> = terms
@@ -239,12 +216,7 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
         .map(|&(t, _)| t)
         .collect();
 
-    // A lookup takes less than one tick of the clock (Apple Silicon's timer
-    // runs at 24 MHz, so one tick = 41.67 ns). Timing lookups one at a time
-    // just reports the tick - V1's "41 ns P50" was exactly that. So time a
-    // pass over all sampled terms and divide; no per-call percentiles here.
-    // black_box stops the optimizer from deleting work whose result we never
-    // use - a classic way to accidentally benchmark nothing.
+    // One lookup is shorter than a clock tick (41.67 ns), so time them in batches.
     let lookup_ns = time_ns(|| {
         for t in &sample {
             std::hint::black_box(index.postings_for(std::hint::black_box(t)));
@@ -254,14 +226,9 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
     println!("\n== Single-term lookup ({} terms, batched) ==", sample.len());
     println!("  avg   {lookup_ns:>9.1} ns");
 
-    // ---------- Intersection: merge vs gallop by length ratio ----------
-    // Pair one long list with shorter lists at controlled length ratios and
-    // time both algorithms on the exact same pair. The crossover ratio is
-    // where Adaptive should switch (GALLOP_RATIO in lib.rs).
+    // Merge vs gallop on the same list pairs at set length ratios.
     let by_len: Vec<&PostingList> =
         terms.iter().map(|&(t, _)| index.postings_for(t).unwrap()).collect();
-    // Never pair a list with itself: every comparison would be Equal, the
-    // branch perfectly predicted, and the ratio-1 row meaninglessly fast.
     let closest = |long: &PostingList, target: usize| -> &PostingList {
         by_len
             .iter()
@@ -270,7 +237,6 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
             .copied()
             .unwrap()
     };
-    // Several long lists, so one unlucky term doesn't decide the answer.
     let longs: Vec<&PostingList> = [0usize, 10, 50, 200].iter().map(|&r| by_len[r]).collect();
 
     println!("\n== Intersection by length ratio (ns per intersection, avg of long lists) ==");
@@ -278,8 +244,6 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
     for ratio in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 1024] {
         let (mut merge_ns, mut gallop_ns) = (0.0, 0.0);
         for &long in &longs {
-            // Materialize the short side outside the timer: in a real query
-            // it's the running result, already a plain sorted Vec.
             let short = closest(long, long.len() / ratio).doc_ids();
             merge_ns += time_ns(|| long.intersect(&short, Strategy::Merge));
             gallop_ns += time_ns(|| long.intersect(&short, Strategy::Gallop));
@@ -294,7 +258,7 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
         );
     }
 
-    // ---------- Multi-term query latency ----------
+    // Multi-term query latency.
     let classes = query_classes(&terms);
     println!("\n== Multi-term query latency ({Q_ITERS} queries/class, end-to-end search) ==");
     println!("  Boolean rows return every match by id. BM25 rows score every match;");
@@ -320,7 +284,6 @@ fn run_single(corpus: &str) -> std::io::Result<()> {
 }
 
 fn run_sharded(corpus: &str, n: usize) -> std::io::Result<()> {
-    // ---------- Indexing: one thread per shard ----------
     let t0 = Instant::now();
     let index = ShardedIndex::from_corpus_file(corpus, n)?;
     let index_time = t0.elapsed();
@@ -331,7 +294,7 @@ fn run_sharded(corpus: &str, n: usize) -> std::io::Result<()> {
     let sizes: Vec<usize> = index.shards().iter().map(|s| s.num_docs()).collect();
     println!("  docs per shard  {sizes:?}");
 
-    // Corpus-wide df per term: each shard only knows its own share.
+    // Each shard only knows its own counts, so add them up.
     let mut df: HashMap<&str, usize> = HashMap::new();
     for shard in index.shards() {
         for (t, l) in shard.terms() {
@@ -340,15 +303,10 @@ fn run_sharded(corpus: &str, n: usize) -> std::io::Result<()> {
     }
     let terms = by_df(df.into_iter().collect());
 
-    // ---------- Fan-out: sequential vs parallel by df ----------
-    // A single-term query's cost grows with its df: every matching doc gets
-    // decoded and scored. Parallel fan-out splits that work but pays to hand
-    // it to the worker threads, so it should only win above some df. Sweep df
-    // to find where (PARALLEL_MIN_WORK in shard.rs).
+    // Sequential vs parallel at different dfs, to find where parallel starts paying off.
     println!("\n== Fan-out by df (single-term BM25 top-10, us per query, 20 terms each) ==");
     println!("  {:>8}  {:>12}  {:>12}  {:>8}", "df", "sequential", "parallel", "speedup");
     for target in [30usize, 100, 300, 1_000, 2_000, 3_000, 10_000, 30_000, 100_000] {
-        // The 20 terms whose df is closest to the target.
         let mut near: Vec<&(&str, usize)> = terms.iter().collect();
         near.sort_by_key(|&&(t, d)| (d.abs_diff(target), t));
         let queries: Vec<&str> = near.iter().take(20).map(|&&(t, _)| t).collect();
@@ -365,7 +323,6 @@ fn run_sharded(corpus: &str, n: usize) -> std::io::Result<()> {
         println!("  {avg_df:>8}  {seq:>12.2}  {par:>12.2}  {:>7.2}x", seq / par);
     }
 
-    // ---------- Multi-term query latency ----------
     let classes = query_classes(&terms);
     println!("\n== Multi-term BM25 top-10 latency ({Q_ITERS} queries/class, {n} shards) ==");
     print_latency_header();

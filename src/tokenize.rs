@@ -1,5 +1,4 @@
-//! Text to lowercase terms, shared by indexing and queries so both see the
-//! same words.
+//! Splits text into lowercase words.
 
 /// "Machine Learning, fast!" -> ["machine", "learning", "fast"]
 pub fn tokenize(text: &str) -> Vec<String> {
@@ -8,14 +7,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-/// The allocation-free tokenizer behind `tokenize`: calls `f` with each
-/// lowercase token. A token is a maximal run of alphanumeric chars.
-///
-/// Already-lowercase ASCII words (almost all of them) are passed as a slice of
-/// `text` with no copy. Words with uppercase ASCII are lowercased into `buf`,
-/// which is reused, so indexing a document does no per-token allocation. Only
-/// non-ASCII words fall back to `str::to_lowercase`, which handles cases like
-/// Greek final sigma that char-by-char lowercasing gets wrong.
+/// Like `tokenize`, but calls `f` on each word instead of allocating a String for it.
 pub fn for_each_token(text: &str, buf: &mut String, mut f: impl FnMut(&str)) {
     let mut emit = |word: &str, upper: bool, non_ascii: bool| {
         if non_ascii {
@@ -30,7 +22,7 @@ pub fn for_each_token(text: &str, buf: &mut String, mut f: impl FnMut(&str)) {
         }
     };
 
-    let mut start = None; // byte offset where the current token began
+    let mut start = None;
     let (mut upper, mut non_ascii) = (false, false);
     for (i, c) in text.char_indices() {
         if c.is_alphanumeric() {
