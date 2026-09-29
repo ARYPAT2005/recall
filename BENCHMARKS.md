@@ -18,6 +18,8 @@ against rows recorded on a different day.
 | 4 | V2/V3 multi-term AND (indexing unchanged) | 1.567 s | 63,809 docs/s | 14.9 ns † | 54.4 MB ‡ | 68.0 MB |
 | 5 | V4 indexing cleanup: zero-copy tokenizer, no per-token key clone, FxHash | **0.499 s** | **200,527 docs/s** | **10.5 ns** | 54.4 MB ‡ | 68.8 MB |
 | 6 | V5 BM25: per-doc term frequencies stored alongside doc ids | 0.565 s | 177,125 docs/s | 10.4 ns | 108.9 MB | 129.2 MB |
+| 7 | V6 `explain` (no engine change) | — | — | — | — | — |
+| 8 | V7 blocked delta + varint posting lists (64-entry blocks) § | 0.572 s | 174,825 docs/s | 9.8 ns | **34.5 MB** (23.4 used) | **52.7 MB** |
 
 † V1 originally recorded 0.041 µs here, which was the clock tick, not the
 lookup (see V4 notes). 14.9 ns is the same SipHash map re-measured with the
@@ -27,6 +29,11 @@ batched method.
 first measured in V5. V5 stores doc ids and term frequencies in two Vecs
 pushed in lockstep, so their capacities are identical and the doc-id half —
 exactly what V1–V4 stored — is 108.9 / 2 = 54.4 MB.
+
+§ V7 was measured with the machine under background load (load average ~5),
+so its row sits next to a V6 build run in the same session, interleaved
+with it: V6 there measured 0.678 s, 108.9 MB of posting lists and 127.3 MB
+peak RSS. Compare V7 against those, not against the rows above.
 
 ## Multi-term query latency
 
@@ -44,6 +51,20 @@ P50 / P99 in µs.
 | (V5 BM25, sort every match) | 360 / 2,606 | 16.2 / 57.9 | 3.08 / 7.17 | 3.04 / 7.17 | 0.63 / 0.83 | 3.38 / 11.1 |
 
 Average hits per query: 9,292 / 149 / 15.9 / 2.3 / 0.0 / 5.4.
+
+### V6 vs V7, same session (P50 / P99 µs)
+
+V6 and V7 builds run alternately, 3 rounds, medians. The machine was under
+background load, so absolute numbers run higher than the table above.
+
+| Class | V6 boolean | V7 boolean | V6 BM25 top-10 | V7 BM25 top-10 |
+|-------|-----------|------------|----------------|----------------|
+| common+common | 142 / 490 | 213 / 635 | 315 / 1,804 | 444 / 2,097 |
+| common+mid | 9.75 / 25.5 | 30.4 / 86.4 | 19.5 / 130 | 46.8 / 160 |
+| common+rare | 2.50 / 5.38 | 5.88 / 9.46 | 3.58 / 10.0 | 8.25 / 17.9 |
+| mid+mid | 3.00 / 7.50 | 6.38 / 14.7 | 3.25 / 8.17 | 7.25 / 18.5 |
+| rare+rare | 0.62 / 1.00 | 0.92 / 1.42 | 0.67 / 0.96 | 0.96 / 1.58 |
+| common×2+rare | 2.96 / 7.00 | 7.04 / 13.4 | 3.46 / 12.1 | 8.25 / 22.9 |
 
 ### Merge vs gallop by length ratio (V3)
 
@@ -161,3 +182,46 @@ averaged over 4 long lists. ns per intersection, fastest of 7 batches.
   the timer symbol lazily), not the index, so an untraced warm-up couldn't
   absorb it. `explain` now runs the query traced twice and reports the
   second run.
+- **V7 compression — posting lists 3.2× smaller, peak RSS 2.4× smaller,
+  queries 1.4–3× slower.** Doc ids are stored as gaps from the previous id,
+  and gaps and term frequencies are LEB128 varints. Delta encoding alone
+  saves nothing — a gap stored as a `u32` is still 4 bytes — the varint is
+  what shrinks it: most gaps and nearly all tfs take one byte. Posting data
+  went from 8 bytes/posting (V5, used) to 2.48; peak RSS from 127.3 to
+  52.7 MB, below V1's 68 MB even though V1 stored no term frequencies.
+- **Blocks keep galloping possible.** Varints can't be indexed, so entries
+  are grouped into blocks with a skip table of (first doc id, byte offset)
+  per block. Lookups gallop over the skip table and decode only blocks that
+  can hold a candidate; a cursor keeps the current block decoded, so
+  consecutive lookups in one block decode it once.
+- **Encoded during indexing, not after.** Compressed lists are append-only,
+  so a repeated term can't go back and bump an encoded tf. Each doc's term
+  counts go into a scratch array indexed by term id, then one (gap, tf)
+  entry per distinct term is appended. No uncompressed copy ever exists,
+  which is why peak RSS drops and not just the final size. Indexing was not
+  slower: 0.572 s vs V6's 0.678 s in the same session.
+- **Where the time went.** A lookup that lands in a new block decodes the
+  whole block first. That's why skewed queries pay most (common+mid 3.1×,
+  common+rare 2.4× at P50) and common+common least (1.5×), since merge
+  decodes every block once anyway. Candidates for the next step: decode a
+  block only up to the id being looked for, and store gaps and tfs in
+  separate streams so intersection doesn't decode tfs it never reads.
+- **Block size, measured.** Memory barely moves with block size; lookup
+  cost does, since a lookup decodes one block:
+
+  | Block | Postings used | common+rare P50 | common+mid P50 | common×2+rare P50 | common+common P50 | Merge/gallop crossover |
+  |---|---|---|---|---|---|---|
+  | 64 | 23.4 MB (2.48 B) | 5.88 µs | 30.4 µs | 7.04 µs | 213 µs | 8–16× |
+  | 128 | 22.9 MB (2.43 B) | 8.50 µs | 38.7 µs | 10.4 µs | 199 µs | 16–32× |
+  | 256 ¶ | 22.7 MB (2.40 B) | 13.9 µs | 39.4 µs | 15.3 µs | 213 µs | 16–32× |
+
+  64 is 30–45% faster on the skewed classes for 2% more bytes. Most real
+  queries mix a rarer term with common ones, so 64 it is.
+  ¶ 256 was a single run, not part of the interleaved A/B.
+- **The gallop threshold depends on the block size.** With 128-entry blocks
+  the crossover moved from 8–16× to 16–32× (gallop 0.93–1.02× at 16×); with
+  64 it's back to 8–16× (0.82× at 8×, 1.05× at 16×), so `GALLOP_RATIO`
+  stays 16.
+- Correctness: besides unit tests across block boundaries and 5-byte
+  varints, V7 returned byte-identical ranked output to V6 (same docs, same
+  scores) for 300 queries drawn from the corpus.

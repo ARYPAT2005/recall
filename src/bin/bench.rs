@@ -37,6 +37,9 @@ fn human_bytes(n: u64) -> String {
     format!("{v:.1} {}", UNITS[u])
 }
 
+/// Runs one query, returns how many documents matched.
+type QueryFn<'a> = dyn Fn(&str) -> usize + 'a;
+
 /// Average nanoseconds per call. Runs in batches long enough (~2 ms) that
 /// timer resolution doesn't matter, and takes the fastest batch to shed noise
 /// from interrupts and frequency scaling.
@@ -195,7 +198,7 @@ fn main() -> std::io::Result<()> {
 
     const Q_ITERS: usize = 5_000;
     // Times `run` over the class's queries; `run` returns the hit count.
-    let measure = |queries: &[String], run: &dyn Fn(&str) -> usize| -> (Vec<Duration>, f64) {
+    let measure = |queries: &[String], run: &QueryFn| -> (Vec<Duration>, f64) {
         for q in queries.iter().take(100) {
             std::hint::black_box(run(q));
         }
@@ -219,7 +222,7 @@ fn main() -> std::io::Result<()> {
         "class", "mode", "P50 us", "P95 us", "P99 us", "avg matched"
     );
     for (name, queries) in &classes {
-        let modes: [(&str, &dyn Fn(&str) -> usize); 5] = [
+        let modes: [(&str, &QueryFn); 5] = [
             ("Merge", &|q| index.search_with(q, Strategy::Merge).len()),
             ("Gallop", &|q| index.search_with(q, Strategy::Gallop).len()),
             ("Adaptive", &|q| index.search_with(q, Strategy::Adaptive).len()),
@@ -243,11 +246,15 @@ fn main() -> std::io::Result<()> {
     // ---------- Memory ----------
     println!("\n== Memory ==");
     println!("  peak RSS        {}", human_bytes(peak_rss_bytes()));
-    println!(
-        "  posting lists   {} ({:.2} bytes/posting)",
-        human_bytes(index.posting_bytes() as u64),
-        index.posting_bytes() as f64 / postings.max(1) as f64
-    );
+    // "used" is what the entries occupy; "allocated" adds Vec growth space.
+    let (used, allocated) = index.posting_bytes();
+    for (label, bytes) in [("used", used), ("allocated", allocated)] {
+        println!(
+            "  postings {label:<9} {} ({:.2} bytes/posting)",
+            human_bytes(bytes as u64),
+            bytes as f64 / postings.max(1) as f64
+        );
+    }
     println!(
         "  RSS/posting     {:.1} bytes",
         peak_rss_bytes() as f64 / postings.max(1) as f64
