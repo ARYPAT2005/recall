@@ -126,8 +126,13 @@ Total 7.83 µs: 4 matched, returning 4.
 ## Layout
 
 ```
-src/lib.rs           the engine: tokenizer, compressed posting lists, intersection,
-                     BM25, top-k, Index, corpus loaders
+src/lib.rs           crate root: module list and public API
+src/index.rs         Index: term dictionary, add_document, the query path, loaders
+src/postings.rs      compressed posting lists (delta + varint blocks, skip table)
+src/intersect.rs     merge / galloping intersection and the rule choosing between them
+src/rank.rs          BM25 pieces and top-k selection
+src/tokenize.rs      allocation-free tokenizer
+src/hash.rs          FxHash
 src/explain.rs       query plans for `explain`
 src/main.rs          interactive search REPL and `explain` command
 src/bin/gencorpus.rs deterministic Zipfian corpus generator

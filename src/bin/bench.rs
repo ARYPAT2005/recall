@@ -5,7 +5,7 @@
 //!
 //! Reports: indexing throughput, query latency percentiles, peak memory.
 
-use recall::{tokenize, Index, PostingList, Strategy};
+use recall::{Index, PostingList, Strategy};
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -261,6 +261,5 @@ fn main() -> std::io::Result<()> {
     );
 
     std::hint::black_box(&index);
-    let _ = tokenize("keep the tokenizer linked");
     Ok(())
 }
