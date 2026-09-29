@@ -8,8 +8,57 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+
+/// FxHash, the hasher rustc uses internally: one rotate, xor and multiply per
+/// 8 bytes. The std default (SipHash) is built to resist HashDoS from
+/// attacker-chosen keys, which costs several times more per short key. Our
+/// keys come from our own corpus, so that protection buys nothing here.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(last));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        // The multiply leaves the best-mixed bits at the top, but hashbrown
+        // picks buckets from the bottom bits. Rotating brings them down.
+        self.hash.rotate_left(26)
+    }
+}
+
+pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// A document's identity is just its position in `doc_names`.
 ///
@@ -20,10 +69,48 @@ pub type DocId = u32;
 
 /// "Machine Learning, fast!" -> ["machine", "learning", "fast"]
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_lowercase())
-        .collect()
+    let mut out = Vec::new();
+    for_each_token(text, &mut String::new(), |t| out.push(t.to_owned()));
+    out
+}
+
+/// The allocation-free tokenizer behind `tokenize`: calls `f` with each
+/// lowercase token. A token is a maximal run of alphanumeric chars.
+///
+/// Already-lowercase ASCII words (almost all of them) are passed as a slice of
+/// `text` with no copy. Words with uppercase ASCII are lowercased into `buf`,
+/// which is reused, so indexing a document does no per-token allocation. Only
+/// non-ASCII words fall back to `str::to_lowercase`, which handles cases like
+/// Greek final sigma that char-by-char lowercasing gets wrong.
+pub fn for_each_token(text: &str, buf: &mut String, mut f: impl FnMut(&str)) {
+    let mut emit = |word: &str, upper: bool, non_ascii: bool| {
+        if non_ascii {
+            f(&word.to_lowercase());
+        } else if upper {
+            buf.clear();
+            buf.push_str(word);
+            buf.make_ascii_lowercase();
+            f(buf);
+        } else {
+            f(word);
+        }
+    };
+
+    let mut start = None; // byte offset where the current token began
+    let (mut upper, mut non_ascii) = (false, false);
+    for (i, c) in text.char_indices() {
+        if c.is_alphanumeric() {
+            start.get_or_insert(i);
+            upper |= c.is_ascii_uppercase();
+            non_ascii |= !c.is_ascii();
+        } else if let Some(s) = start.take() {
+            emit(&text[s..i], upper, non_ascii);
+            (upper, non_ascii) = (false, false);
+        }
+    }
+    if let Some(s) = start {
+        emit(&text[s..], upper, non_ascii);
+    }
 }
 
 /// How two posting lists get intersected. `Adaptive` is what `search` uses;
@@ -117,7 +204,7 @@ pub fn intersect_merge(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 #[derive(Default)]
 pub struct Index {
     /// The inverted index: term -> ascending list of documents containing it.
-    pub postings: HashMap<String, Vec<DocId>>,
+    pub postings: HashMap<String, Vec<DocId>, FxBuildHasher>,
     /// doc_names[id] -> the filename or title
     pub doc_names: Vec<String>,
     /// doc_lens[id] -> token count. Unused today; BM25 needs it in step 5.
@@ -152,20 +239,31 @@ impl Index {
 
     pub fn add_document(&mut self, name: String, text: &str) -> DocId {
         let id = self.doc_names.len() as DocId;
-        let tokens = tokenize(text);
+        let postings = &mut self.postings;
+        let mut len = 0u32;
 
-        for word in tokens.iter() {
-            let list = self.postings.entry(word.clone()).or_default();
-            // Docs arrive in ascending id order, so a duplicate can only be the
-            // final element. This single check keeps every list deduped AND
-            // sorted - which is exactly what the intersection in step 4 needs.
-            if list.last() != Some(&id) {
-                list.push(id);
+        for_each_token(text, &mut String::new(), |word| {
+            len += 1;
+            // get_mut first: entry() needs an owned String key, which would
+            // allocate once per token even though nearly every term already
+            // exists. Only a brand-new term pays for the allocation.
+            match postings.get_mut(word) {
+                // Docs arrive in ascending id order, so a duplicate can only be
+                // the final element. This single check keeps every list deduped
+                // AND sorted - which is exactly what intersection needs.
+                Some(list) => {
+                    if list.last() != Some(&id) {
+                        list.push(id);
+                    }
+                }
+                None => {
+                    postings.insert(word.to_owned(), vec![id]);
+                }
             }
-        }
+        });
 
         self.doc_names.push(name);
-        self.doc_lens.push(tokens.len() as u32);
+        self.doc_lens.push(len);
         id
     }
 

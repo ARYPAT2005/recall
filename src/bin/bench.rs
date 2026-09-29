@@ -109,29 +109,20 @@ fn main() -> std::io::Result<()> {
         .map(|&(t, _)| t.as_str())
         .collect();
 
-    // Warm up: first touches pull the hash table into cache. Measuring those
-    // would conflate cache misses with the algorithm's real cost.
-    for t in sample.iter().take(100) {
-        std::hint::black_box(index.postings_for(t));
-    }
+    // A lookup takes less than one tick of the clock (Apple Silicon's timer
+    // runs at 24 MHz, so one tick = 41.67 ns). Timing lookups one at a time
+    // just reports the tick - V1's "41 ns P50" was exactly that. So time a
+    // pass over all sampled terms and divide; no per-call percentiles here.
+    // black_box stops the optimizer from deleting work whose result we never
+    // use - a classic way to accidentally benchmark nothing.
+    let lookup_ns = time_ns(|| {
+        for t in &sample {
+            std::hint::black_box(index.postings_for(std::hint::black_box(t)));
+        }
+    }) / sample.len() as f64;
 
-    const ITERS: usize = 20_000;
-    let mut latencies = Vec::with_capacity(ITERS);
-    for i in 0..ITERS {
-        let term = sample[i % sample.len()];
-        let t = Instant::now();
-        // black_box stops the optimizer from deleting work whose result we
-        // never use - a classic way to accidentally benchmark nothing.
-        std::hint::black_box(index.postings_for(std::hint::black_box(term)));
-        latencies.push(t.elapsed());
-    }
-    latencies.sort_unstable();
-
-    println!("\n== Single-term query latency ({ITERS} queries) ==");
-    println!("  P50   {:>9.3} us", pct(&latencies, 50.0).as_secs_f64() * 1e6);
-    println!("  P95   {:>9.3} us", pct(&latencies, 95.0).as_secs_f64() * 1e6);
-    println!("  P99   {:>9.3} us", pct(&latencies, 99.0).as_secs_f64() * 1e6);
-    println!("  max   {:>9.3} us", latencies.last().unwrap().as_secs_f64() * 1e6);
+    println!("\n== Single-term lookup ({} terms, batched) ==", sample.len());
+    println!("  avg   {lookup_ns:>9.1} ns");
 
     // ---------- Intersection: merge vs gallop by length ratio ----------
     // Pair one long list with shorter lists at controlled length ratios and

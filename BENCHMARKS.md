@@ -12,10 +12,15 @@ against rows recorded on a different day.
 
 ## Indexing and memory
 
-| Step | Version | Index time | Throughput | Single-term lookup P50 | Peak RSS |
-|------|---------|-----------|------------|-----------|----------|
-| 3 | V1 baseline: single-thread, in-memory, single-term lookup | 1.348 s | 74,182 docs/s | 0.041 µs | 68.3 MB |
-| 4 | V2/V3 multi-term AND (indexing unchanged) | 1.567 s | 63,809 docs/s | 0.041 µs | 68.0 MB |
+| Step | Version | Index time | Throughput | Term lookup | Peak RSS |
+|------|---------|-----------|------------|-------------|----------|
+| 3 | V1 baseline: single-thread, in-memory, single-term lookup | 1.348 s | 74,182 docs/s | 14.9 ns † | 68.3 MB |
+| 4 | V2/V3 multi-term AND (indexing unchanged) | 1.567 s | 63,809 docs/s | 14.9 ns † | 68.0 MB |
+| 5 | V4 indexing cleanup: zero-copy tokenizer, no per-token key clone, FxHash | **0.499 s** | **200,527 docs/s** | **10.5 ns** | 68.8 MB |
+
+† V1 originally recorded 0.041 µs here, which was the clock tick, not the
+lookup (see V4 notes). 14.9 ns is the same SipHash map re-measured with the
+batched method.
 
 ## Multi-term query latency
 
@@ -68,3 +73,31 @@ averaged over 4 long lists. ns per intersection, fastest of 7 batches.
 - Earlier runs drew slightly different queries each time because terms with
   equal document frequency came out in `HashMap` order, which is randomly
   seeded. Ties are now broken by term, so every run uses the same queries.
+- **V4 indexing cleanup — 3.1× faster indexing (1.567 s → 0.499 s, same
+  session).** Measured first: of 1,316 ms, reading lines was ~25 ms (2%),
+  tokenizing ~570 ms (43%), and `HashMap` insertion ~720 ms (55%), across
+  12.9M tokens. Each fix measured alone (fastest of 3):
+
+  | Change | Full index |
+  |---|---|
+  | before | 1,316 ms |
+  | tokenizer yields `&str` slices, no `Vec<String>` | 850 ms |
+  | `get_mut` before insert — allocate a key only for new terms | 550 ms |
+  | FxHash instead of SipHash | 470 ms |
+
+  Reading was left alone because it's 2% of the time.
+- The zero-copy tokenizer path only applies to already-lowercase ASCII
+  words, and the synthetic corpus is 100% lowercase — so this benchmark
+  flatters it. On real text, capitalized words take the next path:
+  lowercased into a reused buffer (still no allocation). Non-ASCII words
+  still allocate via `str::to_lowercase`, which is correct for cases like
+  Greek final sigma.
+- **The V1 "41 ns" lookup was the clock, not the code.** Every per-call
+  latency came out as a multiple of 41.67 ns — one tick of Apple Silicon's
+  24 MHz timer. A single lookup is shorter than one tick, so the bench now
+  times a pass over all sampled terms and divides. Real numbers: 14.9 ns
+  with SipHash, 10.5 ns with FxHash. Per-call percentiles elsewhere are
+  still quantized to 41.67 ns, which is ~7% of the smallest one
+  (rare+rare, ~0.6 µs).
+- Multi-term query latency is unchanged by V4 (within noise), as expected:
+  the query path's cost is intersection, not tokenizing or lookup.
