@@ -12,6 +12,10 @@ use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+use std::time::Instant;
+
+mod explain;
+pub use explain::{Plan, PlanStep, PlanTerm};
 
 /// FxHash, the hasher rustc uses internally: one rotate, xor and multiply per
 /// 8 bytes. The std default (SipHash) is built to resist HashDoS from
@@ -127,6 +131,19 @@ pub enum Strategy {
 /// this many times the shorter one. Chosen from the ratio sweep in bench.rs.
 pub const GALLOP_RATIO: usize = 16;
 
+impl Strategy {
+    /// The algorithm this strategy runs for lists of these lengths: Adaptive
+    /// resolves to Merge or Gallop, the others to themselves.
+    pub fn resolve(self, a_len: usize, b_len: usize) -> Strategy {
+        let (shorter, longer) = (a_len.min(b_len), a_len.max(b_len));
+        match self {
+            Strategy::Adaptive if longer >= shorter.saturating_mul(GALLOP_RATIO) => Strategy::Gallop,
+            Strategy::Adaptive => Strategy::Merge,
+            fixed => fixed,
+        }
+    }
+}
+
 /// Documents present in both sorted, deduped lists, choosing the algorithm
 /// from the length ratio.
 pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
@@ -135,16 +152,9 @@ pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 
 pub fn intersect_with(a: &[DocId], b: &[DocId], strategy: Strategy) -> Vec<DocId> {
     let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    match strategy {
+    match strategy.resolve(small.len(), large.len()) {
         Strategy::Merge => intersect_merge(small, large),
-        Strategy::Gallop => intersect_gallop(small, large),
-        Strategy::Adaptive => {
-            if large.len() >= small.len().saturating_mul(GALLOP_RATIO) {
-                intersect_gallop(small, large)
-            } else {
-                intersect_merge(small, large)
-            }
-        }
+        _ => intersect_gallop(small, large),
     }
 }
 
@@ -268,6 +278,12 @@ impl PostingList {
         (self.docs.capacity() + self.tfs.capacity()) * 4
     }
 }
+
+/// What an unknown query term resolves to. See `Index::matching`.
+static NO_POSTINGS: PostingList = PostingList {
+    docs: Vec::new(),
+    tfs: Vec::new(),
+};
 
 /// BM25's standard parameters. K1 limits how much repeating a term can add
 /// (the 10th "rust" in a doc is worth far less than the 1st). B sets how
@@ -440,13 +456,44 @@ impl Index {
     }
 
     pub fn search_with(&self, query: &str, strategy: Strategy) -> Vec<DocId> {
-        self.matching(query, strategy).1
+        self.matching(query, strategy, None).1
     }
 
     /// The k most relevant documents containing every query term, by BM25.
     pub fn search_ranked(&self, query: &str, k: usize) -> Ranked {
-        let (lists, docs) = self.matching(query, Strategy::Adaptive);
-        let scores = self.score(&lists, &docs);
+        let (lists, docs) = self.matching(query, Strategy::Adaptive, None);
+        self.rank(&lists, &docs, k)
+    }
+
+    /// Run a ranked query and report every decision the engine made: term
+    /// order, each intersection's algorithm and why, and where time went.
+    pub fn explain(&self, query: &str, k: usize) -> Plan {
+        // Run it once and throw that plan away. The first run pays one-time
+        // costs - cold posting lists, and the process's first clock read,
+        // which on macOS resolves the timer symbol lazily (~13 µs) - that
+        // would otherwise land on whichever step happens to go first.
+        self.explain_once(query, k);
+        self.explain_once(query, k)
+    }
+
+    fn explain_once(&self, query: &str, k: usize) -> Plan {
+        let mut plan = Plan {
+            query: query.to_owned(),
+            num_docs: self.num_docs(),
+            k,
+            ..Plan::default()
+        };
+        let (lists, docs) = self.matching(query, Strategy::Adaptive, Some(&mut plan));
+        let start = Instant::now();
+        let ranked = self.rank(&lists, &docs, k);
+        plan.rank_time = start.elapsed();
+        plan.matched = ranked.matched;
+        plan.hits = ranked.hits;
+        plan
+    }
+
+    fn rank(&self, lists: &[&PostingList], docs: &[DocId], k: usize) -> Ranked {
+        let scores = self.score(lists, docs);
         let hits = docs.iter().zip(&scores).map(|(&doc, &score)| Hit { doc, score });
         Ranked {
             matched: docs.len(),
@@ -455,40 +502,72 @@ impl Index {
     }
 
     /// The query's posting lists (rarest first) and the docs in all of them.
-    fn matching(&self, query: &str, strategy: Strategy) -> (Vec<&PostingList>, Vec<DocId>) {
+    /// With `plan`, also records each decision and its timing - the only time
+    /// this path reads the clock.
+    fn matching(
+        &self,
+        query: &str,
+        strategy: Strategy,
+        mut plan: Option<&mut Plan>,
+    ) -> (Vec<&PostingList>, Vec<DocId>) {
+        let started = plan.is_some().then(Instant::now);
         let mut terms = tokenize(query);
         // "rust rust" is one term. Scoring it twice would double its weight.
         terms.sort_unstable();
         terms.dedup();
 
-        let mut lists = Vec::with_capacity(terms.len());
-        for term in &terms {
-            match self.postings.get(term.as_str()) {
-                Some(list) => lists.push(list),
-                None => return (Vec::new(), Vec::new()), // AND with an unknown term
-            }
-        }
-        if lists.is_empty() {
-            return (lists, Vec::new());
-        }
-
+        // An unknown term gets an empty list instead of a special case: it
+        // sorts first as the rarest term, and the intersection comes out
+        // empty, which is exactly what AND means.
+        let mut lists: Vec<(String, &PostingList)> = terms
+            .into_iter()
+            .map(|t| {
+                let list = self.postings.get(t.as_str()).unwrap_or(&NO_POSTINGS);
+                (t, list)
+            })
+            .collect();
         // Shortest first: the result can never outgrow the shortest list, so
         // starting there bounds every later intersection by the rarest term
-        // instead of dragging the longest list through each step.
-        lists.sort_by_key(|l| l.len());
+        // instead of dragging the longest list through each step. The sort is
+        // stable, so equally common terms stay in alphabetical order.
+        lists.sort_by_key(|(_, l)| l.len());
 
-        let first = lists[0].doc_ids();
-        let mut docs = match lists.get(1) {
-            Some(second) => second.intersect(&first, strategy),
-            None => first.into_owned(),
+        if let (Some(plan), Some(started)) = (plan.as_deref_mut(), started) {
+            plan.terms = lists
+                .iter()
+                .map(|(t, l)| PlanTerm {
+                    term: t.clone(),
+                    df: l.len(),
+                    idf: idf(self.num_docs(), l.len()),
+                })
+                .collect();
+            plan.lookup_time = started.elapsed();
+        }
+        let Some(&(_, first)) = lists.first() else {
+            return (Vec::new(), Vec::new());
         };
-        for list in lists.iter().skip(2) {
+
+        let mut docs = first.doc_ids();
+        for (term, list) in &lists[1..] {
             if docs.is_empty() {
                 break;
             }
-            docs = list.intersect(&docs, strategy);
+            let start = plan.is_some().then(Instant::now);
+            let next = list.intersect(&docs, strategy);
+            if let (Some(plan), Some(start)) = (plan.as_deref_mut(), start) {
+                plan.steps.push(PlanStep {
+                    term: term.clone(),
+                    candidates: docs.len(),
+                    df: list.len(),
+                    algorithm: strategy.resolve(docs.len(), list.len()),
+                    matched: next.len(),
+                    time: start.elapsed(),
+                });
+            }
+            docs = Cow::Owned(next);
         }
-        (lists, docs)
+        let docs = docs.into_owned();
+        (lists.into_iter().map(|(_, l)| l).collect(), docs)
     }
 
     /// BM25 score for each of `docs`, which contain every term in `lists`:
@@ -722,6 +801,39 @@ mod tests {
         let twice = idx.search_ranked("rust RUST rust", 10).hits;
         assert_eq!(once, twice);
         assert_eq!(once[0].score, twice[0].score);
+    }
+
+    #[test]
+    fn explain_reports_order_steps_and_same_results_as_search() {
+        let idx = sample();
+        let plan = idx.explain("machine learning rust", 10);
+        // rust (df 2) first; learning and machine (df 3) tie, alphabetical.
+        let order: Vec<&str> = plan.terms.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(order, vec!["rust", "learning", "machine"]);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!((plan.steps[0].candidates, plan.steps[0].df), (2, 3));
+        assert_eq!(plan.steps[0].algorithm, Strategy::Merge); // 1.5x < 16x
+        assert_eq!(plan.hits, idx.search_ranked("machine learning rust", 10).hits);
+        assert_eq!(plan.matched, 1);
+    }
+
+    #[test]
+    fn explain_picks_gallop_for_skewed_lists() {
+        let mut docs = vec!["common rare"];
+        docs.extend(std::iter::repeat("common").take(40));
+        let plan = index(&docs).explain("common rare", 10);
+        assert_eq!(plan.steps[0].algorithm, Strategy::Gallop); // 41 vs 1
+        assert!(plan.to_string().contains("gallop"));
+    }
+
+    #[test]
+    fn explain_stops_at_an_unknown_term() {
+        let plan = sample().explain("machine zebra learning", 10);
+        assert_eq!(plan.terms[0].term, "zebra");
+        assert_eq!(plan.terms[0].df, 0);
+        assert!(plan.steps.is_empty()); // nothing left to intersect
+        assert_eq!(plan.matched, 0);
+        assert!(plan.to_string().contains("never read"));
     }
 
     #[test]

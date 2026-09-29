@@ -142,3 +142,22 @@ averaged over 4 long lists. ns per intersection, fastest of 7 batches.
   the heap — really a heap sort, slower than `sort_unstable`, which made
   top-K look better than it is. `top_k` now sorts directly when k covers
   every hit, and that's what the row measures.
+- **V6 `explain`.** No new optimization — it prints the plan the engine
+  already follows. It shares the query path with normal search; when not
+  explaining, that path reads no clocks, and query latency is unchanged from
+  V5 within noise (≤ one clock tick on small queries, ~3% on common+common).
+  It immediately surfaced where time goes on dense queries. `aal aam`
+  (96K matches):
+
+  | Step | Time |
+  |---|---|
+  | intersect (95,989 vs 99,972, merge) | 128 µs |
+  | BM25-score 95,964 matches, top 10 | 1,307 µs |
+
+  Scoring is 10× the intersection here, which is the per-candidate
+  `tfs_for` gallop noted under V5.
+- The first `explain` in a process reported 13 µs for looking up four terms
+  that take 0.5 µs. It was the first clock read in the process (macOS binds
+  the timer symbol lazily), not the index, so an untraced warm-up couldn't
+  absorb it. `explain` now runs the query traced twice and reports the
+  second run.
