@@ -8,7 +8,7 @@ use crate::tokenize::{for_each_token, tokenize};
 use crate::{DocId, Plan, PlanStep, PlanTerm, Strategy};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Instant;
 
@@ -124,13 +124,12 @@ impl Index {
     }
 
     pub fn search_with(&self, query: &str, strategy: Strategy) -> Vec<DocId> {
-        self.matching(query, strategy, None).1
+        self.matching(&self.weigh(query), strategy, None).1
     }
 
     /// The k most relevant documents containing every query term, by BM25.
     pub fn search_ranked(&self, query: &str, k: usize) -> Ranked {
-        let (lists, docs) = self.matching(query, Strategy::Adaptive, None);
-        self.rank(&lists, &docs, k)
+        self.rank_terms(&self.weigh(query), self.avg_doc_len() as f32, k)
     }
 
     /// Run a ranked query and report every decision the engine made: term
@@ -151,17 +150,39 @@ impl Index {
             k,
             ..Plan::default()
         };
-        let (lists, docs) = self.matching(query, Strategy::Adaptive, Some(&mut plan));
+        let started = Instant::now();
+        let terms = self.weigh(query);
+        plan.lookup_time = started.elapsed();
+        let (lists, docs) = self.matching(&terms, Strategy::Adaptive, Some(&mut plan));
         let start = Instant::now();
-        let ranked = self.rank(&lists, &docs, k);
+        let ranked = self.rank(&terms, &lists, &docs, self.avg_doc_len() as f32, k);
         plan.rank_time = start.elapsed();
         plan.matched = ranked.matched;
         plan.hits = ranked.hits;
         plan
     }
 
-    fn rank(&self, lists: &[&PostingList], docs: &[DocId], k: usize) -> Ranked {
-        let scores = self.score(lists, docs);
+    /// The query's terms weighted by this index's own statistics.
+    fn weigh(&self, query: &str) -> Vec<QueryTerm> {
+        weigh(query, self.num_docs(), |t| self.postings_for(t).map_or(0, |l| l.len()))
+    }
+
+    /// BM25 top-k for already-weighted terms. A shard is called this way, with
+    /// idfs and avg_len computed over the whole corpus instead of just itself.
+    pub(crate) fn rank_terms(&self, terms: &[QueryTerm], avg_len: f32, k: usize) -> Ranked {
+        let (lists, docs) = self.matching(terms, Strategy::Adaptive, None);
+        self.rank(terms, &lists, &docs, avg_len, k)
+    }
+
+    fn rank(
+        &self,
+        terms: &[QueryTerm],
+        lists: &[&PostingList],
+        docs: &[DocId],
+        avg_len: f32,
+        k: usize,
+    ) -> Ranked {
+        let scores = self.score(terms, lists, docs, avg_len);
         let hits = docs.iter().zip(&scores).map(|(&doc, &score)| Hit { doc, score });
         Ranked {
             matched: docs.len(),
@@ -169,62 +190,58 @@ impl Index {
         }
     }
 
-    /// The query's posting lists (rarest first) and the docs in all of them.
-    /// With `plan`, also records each decision and its timing - the only time
-    /// this path reads the clock.
+    /// Each term's posting list (in `terms` order) and the docs in all of
+    /// them. With `plan`, also records each decision and its timing - the only
+    /// time this path reads the clock.
     fn matching(
         &self,
-        query: &str,
+        terms: &[QueryTerm],
         strategy: Strategy,
         mut plan: Option<&mut Plan>,
     ) -> (Vec<&PostingList>, Vec<DocId>) {
         let started = plan.is_some().then(Instant::now);
-        let mut terms = tokenize(query);
-        // "rust rust" is one term. Scoring it twice would double its weight.
-        terms.sort_unstable();
-        terms.dedup();
-
         // An unknown term gets an empty list instead of a special case: it
         // sorts first as the rarest term, and the intersection comes out
         // empty, which is exactly what AND means.
-        let mut lists: Vec<(String, &PostingList)> = terms
-            .into_iter()
-            .map(|t| {
-                let list = self.postings_for(&t).unwrap_or(&NO_POSTINGS);
-                (t, list)
-            })
+        let lists: Vec<&PostingList> = terms
+            .iter()
+            .map(|t| self.postings_for(&t.term).unwrap_or(&NO_POSTINGS))
             .collect();
-        // Shortest first: the result can never outgrow the shortest list, so
-        // starting there bounds every later intersection by the rarest term
-        // instead of dragging the longest list through each step. The sort is
-        // stable, so equally common terms stay in alphabetical order.
-        lists.sort_by_key(|(_, l)| l.len());
+
+        // Execute shortest first: the result can never outgrow the shortest
+        // list, so starting there bounds every later intersection by the
+        // rarest term instead of dragging the longest list through each step.
+        // A shard orders by its own list lengths, which is what its own work
+        // depends on. The sort is stable, so ties keep the given order.
+        let mut order: Vec<usize> = (0..lists.len()).collect();
+        order.sort_by_key(|&i| lists[i].len());
 
         if let (Some(plan), Some(started)) = (plan.as_deref_mut(), started) {
-            plan.terms = lists
+            plan.terms = order
                 .iter()
-                .map(|(t, l)| PlanTerm {
-                    term: t.clone(),
-                    df: l.len(),
-                    idf: idf(self.num_docs(), l.len()),
+                .map(|&i| PlanTerm {
+                    term: terms[i].term.clone(),
+                    df: lists[i].len(),
+                    idf: terms[i].idf,
                 })
                 .collect();
-            plan.lookup_time = started.elapsed();
+            plan.lookup_time += started.elapsed();
         }
-        let Some(&(_, first)) = lists.first() else {
-            return (Vec::new(), Vec::new());
+        let Some(&first) = order.first() else {
+            return (lists, Vec::new());
         };
 
-        let mut docs = first.doc_ids();
-        for (term, list) in &lists[1..] {
+        let mut docs = lists[first].doc_ids();
+        for &i in &order[1..] {
             if docs.is_empty() {
                 break;
             }
+            let list = lists[i];
             let start = plan.is_some().then(Instant::now);
             let next = list.intersect(&docs, strategy);
             if let (Some(plan), Some(start)) = (plan.as_deref_mut(), start) {
                 plan.steps.push(PlanStep {
-                    term: term.clone(),
+                    term: terms[i].term.clone(),
                     candidates: docs.len(),
                     df: list.len(),
                     algorithm: strategy.resolve(docs.len(), list.len()),
@@ -234,7 +251,7 @@ impl Index {
             }
             docs = next;
         }
-        (lists.into_iter().map(|(_, l)| l).collect(), docs)
+        (lists, docs)
     }
 
     /// BM25 score for each of `docs`, which contain every term in `lists`:
@@ -242,9 +259,17 @@ impl Index {
     ///   sum over terms of  idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg_len))
     ///
     /// tf saturates (k1 caps what repetition adds), and a doc longer than
-    /// average needs more occurrences for the same score (b).
-    fn score(&self, lists: &[&PostingList], docs: &[DocId]) -> Vec<f32> {
-        let avg_len = self.avg_doc_len() as f32;
+    /// average needs more occurrences for the same score (b). Terms are added
+    /// in `terms` order, never execution order: float addition isn't
+    /// associative, and a fixed order is what lets shards reproduce a single
+    /// index's scores exactly.
+    fn score(
+        &self,
+        terms: &[QueryTerm],
+        lists: &[&PostingList],
+        docs: &[DocId],
+        avg_len: f32,
+    ) -> Vec<f32> {
         // The length part of the denominator depends only on the doc, so
         // compute it once per doc rather than once per (doc, term).
         let norms: Vec<f32> = docs
@@ -257,12 +282,11 @@ impl Index {
 
         let mut scores = vec![0.0f32; docs.len()];
         let mut tfs = Vec::with_capacity(docs.len());
-        for list in lists {
-            let idf = idf(self.num_docs(), list.len());
+        for (term, list) in terms.iter().zip(lists) {
             list.tfs_for(docs, &mut tfs);
             for ((score, &tf), &norm) in scores.iter_mut().zip(&tfs).zip(&norms) {
                 let tf = tf as f32;
-                *score += idf * tf * (BM25_K1 + 1.0) / (tf + norm);
+                *score += term.idf * tf * (BM25_K1 + 1.0) / (tf + norm);
             }
         }
         scores
@@ -291,8 +315,16 @@ impl Index {
     /// wasted inodes. One file read sequentially is dramatically faster and is
     /// how real corpora ship.
     pub fn from_corpus_file<P: AsRef<Path>>(path: P) -> io::Result<Index> {
+        Index::from_corpus_range(path.as_ref(), 0, u64::MAX)
+    }
+
+    /// Index the lines in bytes [start, end) of a corpus file. `start` must be
+    /// the start of a line; a shard's thread reads just its own slice.
+    pub fn from_corpus_range(path: &Path, start: u64, end: u64) -> io::Result<Index> {
         let mut idx = Index::new();
-        let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let reader = BufReader::with_capacity(1 << 20, file.take(end.saturating_sub(start)));
 
         for line in reader.lines() {
             let line = line?;
@@ -304,6 +336,38 @@ impl Index {
         }
         Ok(idx)
     }
+
+    /// Sum of all document lengths, for corpus-wide averages across shards.
+    pub(crate) fn total_len(&self) -> u64 {
+        self.total_len
+    }
+}
+
+/// A query term, its document frequency, and the idf it's scored with.
+pub(crate) struct QueryTerm {
+    pub term: String,
+    pub df: usize,
+    pub idf: f32,
+}
+
+/// Tokenize and dedupe a query ("rust rust" is one term; scoring it twice
+/// would double its weight), then order the terms by (df, term) and give
+/// each its idf, from whichever statistics the caller passes: an index's own,
+/// or the whole corpus's when the index is one shard of it.
+pub(crate) fn weigh(query: &str, num_docs: usize, df: impl Fn(&str) -> usize) -> Vec<QueryTerm> {
+    let mut terms = tokenize(query);
+    terms.sort_unstable();
+    terms.dedup();
+    let mut with_df: Vec<(usize, String)> = terms.into_iter().map(|t| (df(&t), t)).collect();
+    with_df.sort_by_key(|&(df, _)| df); // stable: equal dfs stay alphabetical
+    with_df
+        .into_iter()
+        .map(|(df, term)| QueryTerm {
+            idf: idf(num_docs, df),
+            df,
+            term,
+        })
+        .collect()
 }
 
 #[cfg(test)]

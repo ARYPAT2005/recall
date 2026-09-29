@@ -29,6 +29,7 @@ the dead ends are in [BENCHMARKS.md](BENCHMARKS.md).
 | V5 | BM25 ranking, top-k by heap | top-10 is 13× faster than sorting 9K matches; posting lists doubled to hold tf |
 | V6 | `explain` query plans | showed BM25 scoring costing 10× the intersection on dense queries |
 | V7 | Blocked delta + varint posting lists | posting lists **3.2× smaller**, peak RSS 127 → 53 MB; queries 1.4–3× slower |
+| V8 | 4 document shards: parallel build, global BM25 stats, worker-pool fan-out | indexing **2.5× faster**, heavy queries **3.0× faster**; light queries 10–60% slower, peak RSS +66% |
 
 Two measurement bugs turned up along the way and are written up in
 BENCHMARKS.md: V1's "41 ns lookup" was one tick of the 24 MHz clock (the
@@ -63,6 +64,24 @@ Delta encoding alone saves nothing; the varint is what shrinks it. Varints can't
 indexed, so entries are grouped in 64-entry blocks with a skip table, and galloping
 runs over the skip table and decodes only the blocks it needs. Lists are encoded
 while indexing, so an uncompressed copy never exists and peak RSS drops too.
+
+**Sharding by document, with corpus-wide statistics.** `--shards N` splits the corpus
+into N contiguous ranges, cut at line boundaries in the file, and builds one `Index`
+per range on its own thread. No locks are needed because no thread touches another's
+index. Every query goes to every shard, and the per-shard top-k lists are merged. The
+subtle part is BM25: each shard only knows its own document counts, and scoring with
+those makes scores from different shards incomparable. So the coordinator sums each
+term's df across shards and hands every shard the corpus-wide idf and average length.
+Scores are also summed in a fixed term order, so sharded results are bit-identical to
+a single index. That's tested at up to 64 shards.
+
+**Parallel only when it pays.** Handing a query to other threads has a fixed cost, so
+cheap queries run on the shards one after another. Before touching any shard, the
+coordinator estimates the query's work from global dfs, the way a database planner
+does: candidates start at the rarest term's df and shrink by df/N per term, assuming
+terms occur independently. Shards run in parallel only above a threshold taken from a
+measured sweep. Each shard has a long-lived worker thread waiting on a channel;
+starting fresh threads per query cost ~45 µs, more than most queries take.
 
 **`explain` runs the real code path.** The query plan is recorded by the same function
 that answers normal searches, with tracing switched on, so it can't drift from what
@@ -100,6 +119,13 @@ cargo run --release -- corpus/docs.tsv
 
 # Show the query plan: term order, which algorithm each step used and why, timings
 cargo run --release -- corpus/docs.tsv explain "aal clamshell aam abas"
+
+# Build 4 shards in parallel and search across them
+cargo run --release -- corpus/docs.tsv --shards 4
+
+# Benchmark sharded indexing and fan-out; --index-only just times the build
+cargo run --release --bin bench -- corpus/docs.tsv --shards 4
+cargo run --release --bin bench -- corpus/docs.tsv --shards 4 --index-only
 ```
 
 Queries are ANDed and ranked by BM25. In the REPL, `:explain <query>` prints the plan:
@@ -131,6 +157,7 @@ src/index.rs         Index: term dictionary, add_document, the query path, loade
 src/postings.rs      compressed posting lists (delta + varint blocks, skip table)
 src/intersect.rs     merge / galloping intersection and the rule choosing between them
 src/rank.rs          BM25 pieces and top-k selection
+src/shard.rs         ShardedIndex: parallel build, worker pool, global stats, merge
 src/tokenize.rs      allocation-free tokenizer
 src/hash.rs          FxHash
 src/explain.rs       query plans for `explain`
@@ -149,7 +176,7 @@ BENCHMARKS.md        every version's numbers, in order
 - [x] V5: BM25 relevance scoring with top-k selection
 - [x] V6: `explain` query plans
 - [x] V7: posting list compression (blocked delta + varint)
+- [x] V8: document-partitioned shards built in parallel, global BM25 statistics,
+      worker-pool fan-out with a cost-based parallel/sequential choice
 - [ ] Win back V7's query cost: decode blocks only as far as needed, separate tf stream
-- [ ] Parallel indexing into document-partitioned shards
-- [ ] Global BM25 statistics across shards
 - [ ] Sharding across processes
