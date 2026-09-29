@@ -5,7 +5,7 @@
 //!
 //! Reports: indexing throughput, query latency percentiles, peak memory.
 
-use recall::{intersect_with, tokenize, DocId, Index, Strategy};
+use recall::{tokenize, Index, PostingList, Strategy};
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -97,8 +97,7 @@ fn main() -> std::io::Result<()> {
     // rather than a pile of misses. Sample across the frequency spectrum:
     // common terms (long posting lists) and rare ones (short) behave very
     // differently, and an average over only rare terms would flatter us.
-    let mut terms: Vec<(&String, usize)> =
-        index.postings.iter().map(|(t, p)| (t, p.len())).collect();
+    let mut terms: Vec<(&str, usize)> = index.terms().map(|(t, l)| (t, l.len())).collect();
     // Break ties by term: HashMap iteration order is randomly seeded, so
     // sorting on length alone would draw different queries every run.
     terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -106,7 +105,7 @@ fn main() -> std::io::Result<()> {
     let sample: Vec<&str> = terms
         .iter()
         .step_by((terms.len() / 500).max(1))
-        .map(|&(t, _)| t.as_str())
+        .map(|&(t, _)| t)
         .collect();
 
     // A lookup takes less than one tick of the clock (Apple Silicon's timer
@@ -128,10 +127,11 @@ fn main() -> std::io::Result<()> {
     // Pair one long list with shorter lists at controlled length ratios and
     // time both algorithms on the exact same pair. The crossover ratio is
     // where Adaptive should switch (GALLOP_RATIO in lib.rs).
-    let by_len: Vec<&[DocId]> = terms.iter().map(|&(t, _)| index.postings_for(t)).collect();
+    let by_len: Vec<&PostingList> =
+        terms.iter().map(|&(t, _)| index.postings_for(t).unwrap()).collect();
     // Never pair a list with itself: every comparison would be Equal, the
     // branch perfectly predicted, and the ratio-1 row meaninglessly fast.
-    let closest = |long: &[DocId], target: usize| -> &[DocId] {
+    let closest = |long: &PostingList, target: usize| -> &PostingList {
         by_len
             .iter()
             .filter(|l| !std::ptr::eq(**l, long))
@@ -140,16 +140,18 @@ fn main() -> std::io::Result<()> {
             .unwrap()
     };
     // Several long lists, so one unlucky term doesn't decide the answer.
-    let longs: Vec<&[DocId]> = [0usize, 10, 50, 200].iter().map(|&r| by_len[r]).collect();
+    let longs: Vec<&PostingList> = [0usize, 10, 50, 200].iter().map(|&r| by_len[r]).collect();
 
     println!("\n== Intersection by length ratio (ns per intersection, avg of long lists) ==");
     println!("  {:>6}  {:>10}  {:>10}  {:>8}", "ratio", "merge", "gallop", "speedup");
     for ratio in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 1024] {
         let (mut merge_ns, mut gallop_ns) = (0.0, 0.0);
         for &long in &longs {
-            let short = closest(long, long.len() / ratio);
-            merge_ns += time_ns(|| intersect_with(long, short, Strategy::Merge));
-            gallop_ns += time_ns(|| intersect_with(long, short, Strategy::Gallop));
+            // Materialize the short side outside the timer: in a real query
+            // it's the running result, already a plain sorted Vec.
+            let short = closest(long, long.len() / ratio).doc_ids();
+            merge_ns += time_ns(|| long.intersect(&short, Strategy::Merge));
+            gallop_ns += time_ns(|| long.intersect(&short, Strategy::Gallop));
         }
         let n = longs.len() as f64;
         println!(
@@ -168,7 +170,7 @@ fn main() -> std::io::Result<()> {
         let n = terms.len() as f64;
         terms[(lo * n) as usize..(hi * n) as usize]
             .iter()
-            .map(|&(t, _)| t.as_str())
+            .map(|&(t, _)| t)
             .collect()
     };
     let common = rank_range(0.0, 0.002); // top 100 terms
@@ -192,34 +194,48 @@ fn main() -> std::io::Result<()> {
     ];
 
     const Q_ITERS: usize = 5_000;
+    // Times `run` over the class's queries; `run` returns the hit count.
+    let measure = |queries: &[String], run: &dyn Fn(&str) -> usize| -> (Vec<Duration>, f64) {
+        for q in queries.iter().take(100) {
+            std::hint::black_box(run(q));
+        }
+        let mut lat = Vec::with_capacity(Q_ITERS);
+        let mut hits = 0usize;
+        for i in 0..Q_ITERS {
+            let q = &queries[i % queries.len()];
+            let t = Instant::now();
+            hits += std::hint::black_box(run(std::hint::black_box(q)));
+            lat.push(t.elapsed());
+        }
+        lat.sort_unstable();
+        (lat, hits as f64 / Q_ITERS as f64)
+    };
+
     println!("\n== Multi-term query latency ({Q_ITERS} queries/class, end-to-end search) ==");
+    println!("  Boolean rows return every match by id. BM25 rows score every match;");
+    println!("  top-10 keeps the best 10 in a heap; 'all' sorts every match.");
     println!(
-        "  {:<18} {:>9} {:>11} {:>11} {:>11} {:>11}",
-        "class", "strategy", "P50 us", "P95 us", "P99 us", "avg hits"
+        "  {:<18} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "class", "mode", "P50 us", "P95 us", "P99 us", "avg matched"
     );
     for (name, queries) in &classes {
-        for strategy in [Strategy::Merge, Strategy::Gallop, Strategy::Adaptive] {
-            for q in queries.iter().take(100) {
-                std::hint::black_box(index.search_with(q, strategy));
-            }
-            let mut lat = Vec::with_capacity(Q_ITERS);
-            let mut hits = 0usize;
-            for i in 0..Q_ITERS {
-                let q = &queries[i % queries.len()];
-                let t = Instant::now();
-                let r = std::hint::black_box(index.search_with(std::hint::black_box(q), strategy));
-                lat.push(t.elapsed());
-                hits += r.len();
-            }
-            lat.sort_unstable();
+        let modes: [(&str, &dyn Fn(&str) -> usize); 5] = [
+            ("Merge", &|q| index.search_with(q, Strategy::Merge).len()),
+            ("Gallop", &|q| index.search_with(q, Strategy::Gallop).len()),
+            ("Adaptive", &|q| index.search_with(q, Strategy::Adaptive).len()),
+            ("BM25 top-10", &|q| index.search_ranked(q, 10).matched),
+            ("BM25 all", &|q| index.search_ranked(q, usize::MAX).matched),
+        ];
+        for (mode, run) in modes {
+            let (lat, avg) = measure(queries, run);
             println!(
-                "  {:<18} {:>9} {:>11.3} {:>11.3} {:>11.3} {:>11.1}",
+                "  {:<18} {:>11} {:>11.3} {:>11.3} {:>11.3} {:>11.1}",
                 name,
-                format!("{strategy:?}"),
+                mode,
                 pct(&lat, 50.0).as_secs_f64() * 1e6,
                 pct(&lat, 95.0).as_secs_f64() * 1e6,
                 pct(&lat, 99.0).as_secs_f64() * 1e6,
-                hits as f64 / Q_ITERS as f64
+                avg
             );
         }
     }
@@ -228,7 +244,12 @@ fn main() -> std::io::Result<()> {
     println!("\n== Memory ==");
     println!("  peak RSS        {}", human_bytes(peak_rss_bytes()));
     println!(
-        "  bytes/posting   {:.1}",
+        "  posting lists   {} ({:.2} bytes/posting)",
+        human_bytes(index.posting_bytes() as u64),
+        index.posting_bytes() as f64 / postings.max(1) as f64
+    );
+    println!(
+        "  RSS/posting     {:.1} bytes",
         peak_rss_bytes() as f64 / postings.max(1) as f64
     );
 

@@ -12,15 +12,21 @@ against rows recorded on a different day.
 
 ## Indexing and memory
 
-| Step | Version | Index time | Throughput | Term lookup | Peak RSS |
-|------|---------|-----------|------------|-------------|----------|
-| 3 | V1 baseline: single-thread, in-memory, single-term lookup | 1.348 s | 74,182 docs/s | 14.9 ns † | 68.3 MB |
-| 4 | V2/V3 multi-term AND (indexing unchanged) | 1.567 s | 63,809 docs/s | 14.9 ns † | 68.0 MB |
-| 5 | V4 indexing cleanup: zero-copy tokenizer, no per-token key clone, FxHash | **0.499 s** | **200,527 docs/s** | **10.5 ns** | 68.8 MB |
+| Step | Version | Index time | Throughput | Term lookup | Posting lists | Peak RSS |
+|------|---------|-----------|------------|-------------|---------------|----------|
+| 3 | V1 baseline: single-thread, in-memory, single-term lookup | 1.348 s | 74,182 docs/s | 14.9 ns † | 54.4 MB ‡ | 68.3 MB |
+| 4 | V2/V3 multi-term AND (indexing unchanged) | 1.567 s | 63,809 docs/s | 14.9 ns † | 54.4 MB ‡ | 68.0 MB |
+| 5 | V4 indexing cleanup: zero-copy tokenizer, no per-token key clone, FxHash | **0.499 s** | **200,527 docs/s** | **10.5 ns** | 54.4 MB ‡ | 68.8 MB |
+| 6 | V5 BM25: per-doc term frequencies stored alongside doc ids | 0.565 s | 177,125 docs/s | 10.4 ns | 108.9 MB | 129.2 MB |
 
 † V1 originally recorded 0.041 µs here, which was the clock tick, not the
 lookup (see V4 notes). 14.9 ns is the same SipHash map re-measured with the
 batched method.
+
+‡ Posting-list bytes (Vec capacity, including unused growth space) were
+first measured in V5. V5 stores doc ids and term frequencies in two Vecs
+pushed in lockstep, so their capacities are identical and the doc-id half —
+exactly what V1–V4 stored — is 108.9 / 2 = 54.4 MB.
 
 ## Multi-term query latency
 
@@ -34,6 +40,8 @@ P50 / P99 in µs.
 | V2 linear merge | 132 / 387 | 21.2 / 84.2 | 16.0 / 78.6 | 2.88 / 6.63 | 0.63 / 1.00 | 36.2 / 133 |
 | V3 adaptive merge/gallop | 133 / 370 | 9.46 / 24.5 | **2.33 / 4.13** | 2.88 / 6.54 | 0.58 / 0.96 | **2.96 / 8.04** |
 | (galloping only, for reference) | 197 / 571 | 9.46 / 24.4 | 2.33 / 4.21 | 3.50 / 7.83 | 0.67 / 0.88 | 2.83 / 7.33 |
+| V5 BM25, top-10 via heap | 281 / 1,315 | 16.0 / 50.2 | 3.25 / 7.71 | 3.00 / 7.25 | 0.58 / 0.83 | 3.29 / 11.0 |
+| (V5 BM25, sort every match) | 360 / 2,606 | 16.2 / 57.9 | 3.08 / 7.17 | 3.04 / 7.17 | 0.63 / 0.83 | 3.38 / 11.1 |
 
 Average hits per query: 9,292 / 149 / 15.9 / 2.3 / 0.0 / 5.4.
 
@@ -101,3 +109,36 @@ averaged over 4 long lists. ns per intersection, fastest of 7 batches.
   (rare+rare, ~0.6 µs).
 - Multi-term query latency is unchanged by V4 (within noise), as expected:
   the query path's cost is intersection, not tokenizing or lookup.
+- **V5 BM25.** Results are now ranked:
+  `idf · tf · (k1 + 1) / (tf + k1 · (1 − b + b · len / avg_len))` summed over
+  query terms, with k1 = 1.2, b = 0.75 and Lucene's always-positive idf. It
+  still ranks only documents that contain every term (conjunctive BM25).
+- BM25 needs each term's count in each doc, which V1–V4 threw away (the
+  dedupe check dropped repeats). Storing it as a second `u32` per posting
+  doubled the posting lists: 54.4 → 108.9 MB, peak RSS 68.8 → 129.2 MB.
+  That's 8 bytes of data per posting plus ~44% unused Vec capacity from
+  doubling growth. Indexing got 13% slower (0.499 → 0.565 s). This is the
+  cost V7's compression goes after.
+- Scoring costs little when few docs match (common+rare 2.33 → 3.25 µs) and
+  a lot when many do: common+common goes 130 → 281 µs at P50 and 367 →
+  1,315 µs at P99, scoring ~9.3K matches per query. `tfs_for` gallops once
+  per candidate even when candidates are dense in the list, where a linear
+  scan would do; left for now because V7 rewrites that lookup anyway.
+- **Top-K by heap.** A max-heap of size k whose top is the worst hit kept;
+  most new hits lose one comparison against it. Measured separately against
+  the alternatives (k = 10, random scores):
+
+  | Hits | Heap | Full sort | `select_nth_unstable` + sort k |
+  |---|---|---|---|
+  | 150 | 1.8 µs | 2.2 µs | 0.5 µs |
+  | 9,300 | 16.6 µs | 217 µs | 31.9 µs |
+  | 50,000 | 77.9 µs | 1,407 µs | 146 µs |
+
+  The heap wins by 13–18× over sorting once there are thousands of matches,
+  and loses to `select_nth_unstable` only below a few hundred, by about
+  1 µs, so it's not worth a hybrid. End to end, top-10 vs sorting every
+  match on common+common: 281 vs 360 µs P50, 1,315 vs 2,606 µs P99.
+- The first version of the "sort every match" row pushed everything through
+  the heap — really a heap sort, slower than `sort_unstable`, which made
+  top-K look better than it is. `top_k` now sorts directly when k covers
+  every hit, and that's what the row measures.

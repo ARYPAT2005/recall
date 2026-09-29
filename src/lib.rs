@@ -6,7 +6,8 @@
 //! process.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader};
@@ -147,9 +148,23 @@ pub fn intersect_with(a: &[DocId], b: &[DocId], strategy: Strategy) -> Vec<DocId
     }
 }
 
-/// Galloping (exponential) search: for each id in `small`, probe `large` at
-/// offsets 1, 2, 4, 8... past the last match until we overshoot, then binary
-/// search inside that bracket. Cost is O(m log(n/m)) instead of O(m + n), so
+/// Index of the first element of `s` that is >= `id`. Probes s[1], s[2],
+/// s[4]... until one is too big, then binary-searches that bracket, so the
+/// cost is O(log k) where k is the answer: a nearby target is cheap.
+fn gallop_to(s: &[DocId], id: DocId) -> usize {
+    // Double `hi` while s[hi] is still too small. When it stops, the answer
+    // lies in s[hi/2 ..= hi].
+    let mut hi = 1;
+    while hi < s.len() && s[hi] < id {
+        hi *= 2;
+    }
+    let lo = hi / 2;
+    let end = (hi + 1).min(s.len());
+    lo + s[lo..end].partition_point(|&x| x < id)
+}
+
+/// Galloping (exponential) search: for each id in `small`, gallop forward in
+/// `large` from the last match. Cost is O(m log(n/m)) instead of O(m + n), so
 /// "zyzzyva AND the" skips most of the 90K-entry list rather than walking it.
 /// Loses to merge when the lists are similar in length: every step pays for a
 /// binary search where merge would just bump a cursor.
@@ -158,18 +173,7 @@ pub fn intersect_gallop(small: &[DocId], large: &[DocId]) -> Vec<DocId> {
     // Everything in large[..base] is already known to be < the current id.
     let mut base = 0;
     for &id in small {
-        let rest = &large[base..];
-
-        // Double `hi` while rest[hi] is still too small. When it stops, id
-        // (if present) lies in rest[hi/2 ..= hi].
-        let mut hi = 1;
-        while hi < rest.len() && rest[hi] < id {
-            hi *= 2;
-        }
-        let lo = hi / 2;
-        let end = (hi + 1).min(rest.len());
-        base += lo + rest[lo..end].partition_point(|&x| x < id);
-
+        base += gallop_to(&large[base..], id);
         if base == large.len() {
             break; // every remaining id in small is past the end of large
         }
@@ -201,14 +205,164 @@ pub fn intersect_merge(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
     out
 }
 
+/// One term's postings: the documents containing it, ascending, and how many
+/// times the term occurs in each (term frequency, which BM25 needs).
+///
+/// Search code only goes through these methods, never the raw vectors, so
+/// the storage behind them can change without touching the query path.
+#[derive(Default)]
+pub struct PostingList {
+    docs: Vec<DocId>,
+    tfs: Vec<u32>,
+}
+
+impl PostingList {
+    /// Document frequency: how many documents contain the term.
+    pub fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
+    /// Record one occurrence of the term in `id`. Docs arrive in ascending id
+    /// order, so a repeat can only be the final entry: bump its count instead
+    /// of pushing. That one check keeps the list sorted and deduped, which is
+    /// exactly what intersection needs.
+    fn add(&mut self, id: DocId) {
+        if self.docs.last() == Some(&id) {
+            *self.tfs.last_mut().unwrap() += 1;
+        } else {
+            self.docs.push(id);
+            self.tfs.push(1);
+        }
+    }
+
+    /// Every doc id, ascending.
+    pub fn doc_ids(&self) -> Cow<'_, [DocId]> {
+        Cow::Borrowed(&self.docs)
+    }
+
+    /// The ids in `candidates` (sorted) that this list also contains.
+    pub fn intersect(&self, candidates: &[DocId], strategy: Strategy) -> Vec<DocId> {
+        intersect_with(candidates, &self.docs, strategy)
+    }
+
+    /// Term frequency in each of `docs`, which must all be in this list - they
+    /// are the output of intersecting with it. Gallops, since `docs` is never
+    /// longer than the list and consecutive hits are cheap to step between.
+    pub fn tfs_for(&self, docs: &[DocId], out: &mut Vec<u32>) {
+        out.clear();
+        let mut base = 0;
+        for &id in docs {
+            base += gallop_to(&self.docs[base..], id);
+            debug_assert_eq!(self.docs[base], id, "tfs_for: doc not in list");
+            out.push(self.tfs[base]);
+            base += 1;
+        }
+    }
+
+    /// Heap bytes held by this list, including unused Vec capacity.
+    pub fn heap_bytes(&self) -> usize {
+        (self.docs.capacity() + self.tfs.capacity()) * 4
+    }
+}
+
+/// BM25's standard parameters. K1 limits how much repeating a term can add
+/// (the 10th "rust" in a doc is worth far less than the 1st). B sets how
+/// strongly long documents are penalized for matching by sheer length.
+pub const BM25_K1: f32 = 1.2;
+pub const BM25_B: f32 = 0.75;
+
+/// Inverse document frequency: rare terms count for more. This is the Lucene
+/// form, ln(1 + (N - df + 0.5) / (df + 0.5)), which stays positive even for a
+/// term in every document (the textbook form goes negative there).
+pub fn idf(num_docs: usize, df: usize) -> f32 {
+    let (n, df) = (num_docs as f32, df as f32);
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+/// A scored document.
+#[derive(Clone, Copy, Debug)]
+pub struct Hit {
+    pub doc: DocId,
+    pub score: f32,
+}
+
+/// Ordered best first: `a < b` means a ranks above b. Higher score wins, and
+/// ties go to the lower doc id so results come out the same every run.
+impl Ord for Hit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(self.doc.cmp(&other.doc))
+    }
+}
+
+impl PartialOrd for Hit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Hit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Hit {}
+
+/// The k best hits, best first, in O(n log k) instead of sorting all n.
+///
+/// BinaryHeap is a max-heap, and Hit orders best first, so the heap's top is
+/// the *worst* of the k kept so far. Each new hit either loses to it - one
+/// comparison, the common case once the heap has filled with good hits - or
+/// replaces it and sifts down in O(log k).
+///
+/// When k covers every hit there is nothing to select: pushing them all
+/// through the heap would just be a slow heap sort, so sort directly.
+pub fn top_k(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
+    let hits = hits.into_iter();
+    if hits.size_hint().1.is_some_and(|n| n <= k) {
+        let mut all: Vec<Hit> = hits.collect();
+        all.sort_unstable();
+        return all;
+    }
+    let mut heap = BinaryHeap::new();
+    if k == 0 {
+        return Vec::new();
+    }
+    for hit in hits {
+        if heap.len() < k {
+            heap.push(hit);
+        } else if let Some(mut worst) = heap.peek_mut() {
+            if hit < *worst {
+                *worst = hit;
+            }
+        }
+    }
+    heap.into_sorted_vec()
+}
+
+/// Ranked results: how many documents matched, and the best of them.
+pub struct Ranked {
+    pub matched: usize,
+    pub hits: Vec<Hit>,
+}
+
 #[derive(Default)]
 pub struct Index {
-    /// The inverted index: term -> ascending list of documents containing it.
-    pub postings: HashMap<String, Vec<DocId>, FxBuildHasher>,
+    /// The inverted index: term -> its posting list.
+    postings: HashMap<String, PostingList, FxBuildHasher>,
     /// doc_names[id] -> the filename or title
     pub doc_names: Vec<String>,
-    /// doc_lens[id] -> token count. Unused today; BM25 needs it in step 5.
+    /// doc_lens[id] -> token count, for BM25's length normalization.
     pub doc_lens: Vec<u32>,
+    /// Sum of doc_lens, so avg_doc_len is O(1) on the query path.
+    total_len: u64,
 }
 
 impl Index {
@@ -226,7 +380,12 @@ impl Index {
 
     /// Total entries across all posting lists - the real size driver.
     pub fn num_postings(&self) -> usize {
-        self.postings.values().map(|v| v.len()).sum()
+        self.postings.values().map(|l| l.len()).sum()
+    }
+
+    /// Heap bytes held by all posting lists (not the term strings or table).
+    pub fn posting_bytes(&self) -> usize {
+        self.postings.values().map(|l| l.heap_bytes()).sum()
     }
 
     /// Average document length in tokens. BM25 needs this.
@@ -234,7 +393,12 @@ impl Index {
         if self.doc_lens.is_empty() {
             return 0.0;
         }
-        self.doc_lens.iter().map(|&l| l as f64).sum::<f64>() / self.doc_lens.len() as f64
+        self.total_len as f64 / self.doc_lens.len() as f64
+    }
+
+    /// Every term with its posting list, in no particular order.
+    pub fn terms(&self) -> impl Iterator<Item = (&str, &PostingList)> {
+        self.postings.iter().map(|(t, l)| (t.as_str(), l))
     }
 
     pub fn add_document(&mut self, name: String, text: &str) -> DocId {
@@ -248,44 +412,64 @@ impl Index {
             // allocate once per token even though nearly every term already
             // exists. Only a brand-new term pays for the allocation.
             match postings.get_mut(word) {
-                // Docs arrive in ascending id order, so a duplicate can only be
-                // the final element. This single check keeps every list deduped
-                // AND sorted - which is exactly what intersection needs.
-                Some(list) => {
-                    if list.last() != Some(&id) {
-                        list.push(id);
-                    }
-                }
+                Some(list) => list.add(id),
                 None => {
-                    postings.insert(word.to_owned(), vec![id]);
+                    let mut list = PostingList::default();
+                    list.add(id);
+                    postings.insert(word.to_owned(), list);
                 }
             }
         });
 
         self.doc_names.push(name);
         self.doc_lens.push(len);
+        self.total_len += len as u64;
         id
     }
 
-    /// The posting list for one term. Empty slice if the term is unknown.
-    pub fn postings_for(&self, term: &str) -> &[DocId] {
-        self.postings.get(term).map(|v| v.as_slice()).unwrap_or(&[])
+    /// The posting list for one term, if any document contains it.
+    pub fn postings_for(&self, term: &str) -> Option<&PostingList> {
+        self.postings.get(term)
     }
 
-    /// Boolean AND: documents containing every term in the query. The query
-    /// goes through the same tokenizer as the documents, so "Machine
+    /// Boolean AND: documents containing every term in the query, ascending.
+    /// The query goes through the same tokenizer as the documents, so "Machine
     /// Learning!" and "machine learning" are the same search.
     pub fn search(&self, query: &str) -> Vec<DocId> {
         self.search_with(query, Strategy::Adaptive)
     }
 
     pub fn search_with(&self, query: &str, strategy: Strategy) -> Vec<DocId> {
-        let mut lists: Vec<&[DocId]> = tokenize(query)
-            .iter()
-            .map(|t| self.postings_for(t))
-            .collect();
+        self.matching(query, strategy).1
+    }
+
+    /// The k most relevant documents containing every query term, by BM25.
+    pub fn search_ranked(&self, query: &str, k: usize) -> Ranked {
+        let (lists, docs) = self.matching(query, Strategy::Adaptive);
+        let scores = self.score(&lists, &docs);
+        let hits = docs.iter().zip(&scores).map(|(&doc, &score)| Hit { doc, score });
+        Ranked {
+            matched: docs.len(),
+            hits: top_k(hits, k),
+        }
+    }
+
+    /// The query's posting lists (rarest first) and the docs in all of them.
+    fn matching(&self, query: &str, strategy: Strategy) -> (Vec<&PostingList>, Vec<DocId>) {
+        let mut terms = tokenize(query);
+        // "rust rust" is one term. Scoring it twice would double its weight.
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut lists = Vec::with_capacity(terms.len());
+        for term in &terms {
+            match self.postings.get(term.as_str()) {
+                Some(list) => lists.push(list),
+                None => return (Vec::new(), Vec::new()), // AND with an unknown term
+            }
+        }
         if lists.is_empty() {
-            return Vec::new();
+            return (lists, Vec::new());
         }
 
         // Shortest first: the result can never outgrow the shortest list, so
@@ -293,19 +477,49 @@ impl Index {
         // instead of dragging the longest list through each step.
         lists.sort_by_key(|l| l.len());
 
-        if lists.len() == 1 {
-            return lists[0].to_vec();
-        }
-        // Intersect the first pair straight from the index instead of copying
-        // the shortest list just to intersect the copy.
-        let mut result = intersect_with(lists[0], lists[1], strategy);
-        for list in &lists[2..] {
-            if result.is_empty() {
+        let first = lists[0].doc_ids();
+        let mut docs = match lists.get(1) {
+            Some(second) => second.intersect(&first, strategy),
+            None => first.into_owned(),
+        };
+        for list in lists.iter().skip(2) {
+            if docs.is_empty() {
                 break;
             }
-            result = intersect_with(&result, list, strategy);
+            docs = list.intersect(&docs, strategy);
         }
-        result
+        (lists, docs)
+    }
+
+    /// BM25 score for each of `docs`, which contain every term in `lists`:
+    ///
+    ///   sum over terms of  idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg_len))
+    ///
+    /// tf saturates (k1 caps what repetition adds), and a doc longer than
+    /// average needs more occurrences for the same score (b).
+    fn score(&self, lists: &[&PostingList], docs: &[DocId]) -> Vec<f32> {
+        let avg_len = self.avg_doc_len() as f32;
+        // The length part of the denominator depends only on the doc, so
+        // compute it once per doc rather than once per (doc, term).
+        let norms: Vec<f32> = docs
+            .iter()
+            .map(|&d| {
+                let len = self.doc_lens[d as usize] as f32;
+                BM25_K1 * (1.0 - BM25_B + BM25_B * len / avg_len)
+            })
+            .collect();
+
+        let mut scores = vec![0.0f32; docs.len()];
+        let mut tfs = Vec::with_capacity(docs.len());
+        for list in lists {
+            let idf = idf(self.num_docs(), list.len());
+            list.tfs_for(docs, &mut tfs);
+            for ((score, &tf), &norm) in scores.iter_mut().zip(&tfs).zip(&norms) {
+                let tf = tf as f32;
+                *score += idf * tf * (BM25_K1 + 1.0) / (tf + norm);
+            }
+        }
+        scores
     }
 
     /// Index every .txt file in a directory. Good for small hand-written corpora.
@@ -422,6 +636,92 @@ mod tests {
         let idx = sample();
         assert_eq!(idx.search("  Machine, LEARNING!\n"), vec![0, 2]);
         assert_eq!(idx.search("learning learning"), vec![0, 2, 3]);
+    }
+
+    fn index(docs: &[&str]) -> Index {
+        let mut idx = Index::new();
+        for (i, text) in docs.iter().enumerate() {
+            idx.add_document(format!("d{i}"), text);
+        }
+        idx
+    }
+
+    fn ranked_ids(idx: &Index, query: &str) -> Vec<DocId> {
+        idx.search_ranked(query, 10).hits.iter().map(|h| h.doc).collect()
+    }
+
+    #[test]
+    fn term_frequencies_are_counted_per_doc() {
+        let idx = sample();
+        let list = idx.postings_for("learning").unwrap();
+        assert_eq!(list.len(), 3); // df counts documents, not occurrences
+        let mut tfs = Vec::new();
+        list.tfs_for(&[0, 2, 3], &mut tfs);
+        assert_eq!(tfs, vec![1, 2, 1]); // doc c says "learning" twice
+    }
+
+    #[test]
+    fn bm25_matches_hand_computed_score() {
+        // N = 2, df(rust) = 1, avg_len = 1.5, doc 0 has len 1 and tf 1.
+        // idf  = ln(1 + (2 - 1 + 0.5) / (1 + 0.5)) = ln 2
+        // norm = 1.2 * (1 - 0.75 + 0.75 * 1 / 1.5) = 0.9
+        // score = ln 2 * 1 * 2.2 / (1 + 0.9)
+        let idx = index(&["rust", "go go"]);
+        let hits = idx.search_ranked("rust", 10).hits;
+        let expected = 2f32.ln() * 2.2 / 1.9;
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score - expected).abs() < 1e-6, "{} vs {expected}", hits[0].score);
+    }
+
+    #[test]
+    fn bm25_rewards_term_frequency_and_short_docs() {
+        // More occurrences in docs of equal length ranks higher...
+        let idx = index(&["rust go go", "rust rust go"]);
+        assert_eq!(ranked_ids(&idx, "rust"), vec![1, 0]);
+        // ...and the same count in a shorter doc ranks higher.
+        let idx = index(&["rust a b c d e", "rust a"]);
+        assert_eq!(ranked_ids(&idx, "rust"), vec![1, 0]);
+    }
+
+    #[test]
+    fn bm25_weights_rare_terms_more() {
+        // "machine" is in 3 docs, "rust" in 2. Docs 0 and 1 both match the
+        // query with the same length; doc 1 has more of the rarer term.
+        let idx = index(&["machine machine rust", "machine rust rust", "machine"]);
+        assert_eq!(ranked_ids(&idx, "machine rust"), vec![1, 0]);
+    }
+
+    #[test]
+    fn ranking_is_top_k_with_deterministic_ties() {
+        let idx = index(&["rust", "rust", "rust rust", "rust"]);
+        let r = idx.search_ranked("rust", 2);
+        assert_eq!(r.matched, 4);
+        // Doc 2 scores highest; docs 0, 1 and 3 tie, and the lowest id wins.
+        assert_eq!(r.hits.iter().map(|h| h.doc).collect::<Vec<_>>(), vec![2, 0]);
+        assert!(idx.search_ranked("rust", 0).hits.is_empty());
+    }
+
+    #[test]
+    fn top_k_equals_full_sort() {
+        let hits: Vec<Hit> = (0..500)
+            .map(|i| Hit { doc: i, score: ((i * 7919) % 97) as f32 })
+            .collect();
+        let mut sorted = hits.clone();
+        sorted.sort();
+        for k in [1, 5, 10, 97, 500, 1000] {
+            let got: Vec<DocId> = top_k(hits.iter().copied(), k).iter().map(|h| h.doc).collect();
+            let want: Vec<DocId> = sorted.iter().take(k).map(|h| h.doc).collect();
+            assert_eq!(got, want, "k = {k}");
+        }
+    }
+
+    #[test]
+    fn repeated_query_terms_count_once() {
+        let idx = sample();
+        let once = idx.search_ranked("rust", 10).hits;
+        let twice = idx.search_ranked("rust RUST rust", 10).hits;
+        assert_eq!(once, twice);
+        assert_eq!(once[0].score, twice[0].score);
     }
 
     #[test]

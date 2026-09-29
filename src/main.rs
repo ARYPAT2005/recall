@@ -35,16 +35,16 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let hits = index.search(&line);
-        if hits.is_empty() {
+        let results = index.search_ranked(&line, 10);
+        if results.matched == 0 {
             println!("No results.");
         } else {
-            println!("{} result(s):", hits.len());
-            for id in hits.iter().take(10) {
-                println!("  {}", index.doc_names[*id as usize]);
+            println!("{} result(s), best first by BM25:", results.matched);
+            for hit in &results.hits {
+                println!("  {:>7.3}  {}", hit.score, index.doc_names[hit.doc as usize]);
             }
-            if hits.len() > 10 {
-                println!("  ... and {} more", hits.len() - 10);
+            if results.matched > results.hits.len() {
+                println!("  ... and {} more", results.matched - results.hits.len());
             }
         }
     }
